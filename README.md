@@ -61,7 +61,9 @@ If you hit issues, please open an issue with `--verbose 3` output.
 
 ## Download / build
 
-Pre-built binaries: see [Releases](../../releases) (once published).
+Pre-built binaries: [`prebuilt/`](prebuilt) (compiled straight from the
+source in this repo — you still need to add WinDivert's own files, see
+[`prebuilt/README.md`](prebuilt/README.md)).
 
 To build yourself (Linux, cross-compiling with mingw-w64):
 
