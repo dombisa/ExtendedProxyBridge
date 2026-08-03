@@ -1,0 +1,47 @@
+{
+  "_readme": "SCENARIO 1: THE SIMPLEST CASE. Only one process (Telegram) goes through the proxy. Everything else on the machine works direct, untouched by the proxy. A good starting point to check the service actually works before making things more complex. UPDATED: DnsResolution added — Telegram's DNS queries no longer leak in the clear either, they're resolved through the proxy itself now.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "_note_LocalhostViaProxy": "false = traffic to 127.0.0.1 never goes through the proxy, even if a rule would allow it. Should almost always be false — most proxy servers block localhost for security reasons (SSRF protection), and if the proxy is on another machine, localhost traffic wouldn't make sense there anyway.",
+  "IsTrafficLoggingEnabled": true,
+  "_note_IsTrafficLoggingEnabled": "true = every connection (which app, where to, through which proxy) shows up in the GUI/logs. Useful while debugging; can be turned off (false) once everything is configured and stable — slightly less overhead.",
+
+  "ProxyConfigs": [
+    {
+      "_note": "The only proxy server in this profile. Id=1 is referenced by the rules below via ProxyConfigId.",
+      "Id": 1,
+      "Type": "SOCKS5",
+      "Host": "127.0.0.1",
+      "Port": "9050",
+      "Username": "",
+      "Password": ""
+    }
+  ],
+
+  "ProxyRules": [
+    {
+      "_note": "Telegram goes through proxy Id=1. hosts=* and ports=* means: any host, any port — i.e. ALL of Telegram's connections.",
+      "ProcessName": "Telegram.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": true,
+      "DnsResolution": "proxy;system",
+      "_note_DnsResolution": "NEW. 'proxy;system' means: first try resolving domains (e.g. api.telegram.org) through the proxy server itself (127.0.0.1:9050) — so even the fact of 'which domains Telegram visits' isn't visible in the machine's normal DNS traffic. If the proxy is unreachable, fall back to resolving through Windows (system) as usual. You can drop this field entirely — behaviour then reverts to before (DNS untouched, only the actual traffic gets proxied)."
+    },
+    {
+      "_note": "Explicit catch-all rule: everything else (any other process) goes direct, no proxy. Technically this could be omitted entirely — if no rule matches, ProxyBridge already defaults to direct traffic. But it's included here to make the intent explicit in the file itself.",
+      "ProcessName": "*",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "DIRECT",
+      "ProxyConfigId": 0,
+      "IsEnabled": true
+    }
+  ]
+}

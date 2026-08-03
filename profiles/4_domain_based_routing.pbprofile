@@ -1,0 +1,56 @@
+{
+  "_readme": "SCENARIO 4: DOMAIN-BASED ROUTING WITHIN A SINGLE APP. Chrome goes through the proxy only when talking to specific domains (e.g. *.google.com and *.youtube.com), everything else in the same browser goes direct. OLD LIMITATION (used to apply): domain filtering only worked by 'sniffing' plaintext DNS queries — if DNS-over-HTTPS/DNS-over-TLS is enabled in Windows, the filter wouldn't fire. UPDATED: with the DnsResolution field this limitation is gone now — see the note on the first rule below.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+
+  "ProxyConfigs": [
+    {
+      "_note": "The proxy that only google.com and youtube.com traffic from Chrome will go through.",
+      "Id": 1,
+      "Type": "SOCKS5",
+      "Host": "127.0.0.1",
+      "Port": "1080",
+      "Username": "",
+      "Password": ""
+    }
+  ],
+
+  "ProxyRules": [
+    {
+      "_note": "Chrome + specific domains -> proxy. TargetDomains supports several domains separated by semicolons, and a leading wildcard (*.google.com means 'google.com and any subdomain').",
+      "ProcessName": "chrome.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "*.google.com;*.youtube.com;*.gstatic.com",
+      "Protocol": "BOTH",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": true,
+      "DnsResolution": "proxy;system",
+      "_note_DnsResolution": "NEW, removes the old DoH/DoT limitation. Previously, domain filtering depended on actually seeing Chrome's DNS query fly by in the clear (which doesn't work with DoH/DoT enabled). Now the program intercepts Chrome's DNS query itself and resolves it through the proxy — DoH/DoT being on or off in Windows no longer matters, because Chrome's real DNS query never reaches the network at all. IMPORTANT NUANCE: this field sits on the FIRST matching PROXY rule for chrome.exe (in file order) — so it governs DNS resolution for ALL of Chrome's domains, not just google/youtube. This is expected: the decision of whether to intercept DNS is made once per process, not per site — otherwise the program would need to know what domain is being asked about before it even knows what domain is being asked about."
+    },
+    {
+      "_note": "A second rule for Chrome, with NO domain filter (empty TargetDomains = any domain). It catches the rest of Chrome's traffic that didn't match the first rule (a non-matching rule just lets the check continue to the next rule rather than stopping it). The order of these two Chrome-specific rules relative to each other doesn't matter -- works either way.",
+      "ProcessName": "chrome.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "DIRECT",
+      "ProxyConfigId": 0,
+      "IsEnabled": true
+    },
+    {
+      "_note": "Every other process (not Chrome) — direct.",
+      "ProcessName": "*",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "DIRECT",
+      "ProxyConfigId": 0,
+      "IsEnabled": true
+    }
+  ]
+}

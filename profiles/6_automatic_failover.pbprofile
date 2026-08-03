@@ -1,0 +1,50 @@
+{
+  "_readme": "SCENARIO 6: AUTOMATIC FAILOVER BETWEEN TWO PROXIES. This is a new capability that doesn't exist in the original project. All apps go through the primary proxy (Id=1). Every 10 seconds a background thread checks whether it's alive (a plain TCP connect to its port, no real traffic). If the primary stops responding -- automatically, with no restart and no action needed from you -- all traffic switches to the backup (Id=2). Once the primary comes back, the very next check switches traffic back to it.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+
+  "HealthCheckEnabled": true,
+  "_note_HealthCheckEnabled": "Turns on background proxy liveness checking. Without this field (or set to false), the FallbackConfigId on the proxies below is simply ignored -- the program behaves as if failover didn't exist at all (deliberate, for backward compatibility with old profiles).",
+  "HealthCheckIntervalSeconds": 10,
+  "_note_HealthCheckIntervalSeconds": "How often to check (in seconds). 10 is a good balance for home/office use: fast enough to react to an outage, but not hammering the proxy server with checks every second. For critical servers you could use 5 (the minimum accepted), for slow mobile connections maybe 60.",
+
+  "ProxyConfigs": [
+    {
+      "_note": "The primary proxy (Id=1). All traffic goes here by default.",
+      "Id": 1,
+      "Type": "SOCKS5",
+      "Host": "203.0.113.10",
+      "Port": "1080",
+      "Username": "",
+      "Password": "",
+      "FallbackConfigId": 2,
+      "_note_FallbackConfigId": "If proxy Id=1 doesn't respond to the health check, proxy Id=2 is used automatically. Chains can go longer: Id=2 could in turn have its own FallbackConfigId=3, and so on."
+    },
+    {
+      "_note": "The backup proxy (Id=2). Not used at all in normal operation -- only kicks in automatically when the primary is unreachable.",
+      "Id": 2,
+      "Type": "SOCKS5",
+      "Host": "198.51.100.20",
+      "Port": "1080",
+      "Username": "",
+      "Password": "",
+      "FallbackConfigId": 0,
+      "_note_FallbackConfigId": "0 -- the backup proxy has no fallback of its own, nowhere further to go. If both proxies happen to be down at the same time, the rule below behaves as if 'no proxy is configured', meaning traffic goes DIRECT. Keep this in mind: a total failure of both proxies means a temporary direct-traffic leak -- a deliberate tradeoff (the alternative would be cutting off internet entirely for every app with a PROXY rule)."
+    }
+  ],
+
+  "ProxyRules": [
+    {
+      "_note": "Every app -> proxy Id=1. The proxy actually used (1 or 2) is chosen automatically based on which is alive right now; this reference is just the starting point of the chain.",
+      "ProcessName": "*",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": true
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "_readme": "SCENARIO 7: THREE DNS RESOLUTION PRIORITY MODES. Three different programs, each with a different order in DnsResolution, to show the difference between modes clearly side by side. In a real-world profile you'd usually only need ONE of these on any given rule, not all three at once -- they're just laid out here for comparison.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+
+  "CustomDnsServers": "94.140.14.14:53;94.140.15.15:53",
+  "_note_CustomDnsServers": "Your own DNS servers (here — AdGuard DNS, as an example). Tried in order, first one to answer wins. Only needed if at least one rule below has 'custom' in its DnsResolution.",
+
+  "ProxyConfigs": [
+    {
+      "_note": "One proxy shared by all three examples below.",
+      "Id": 1,
+      "Type": "SOCKS5",
+      "Host": "127.0.0.1",
+      "Port": "1080",
+      "Username": "",
+      "Password": ""
+    }
+  ],
+
+  "ProxyRules": [
+    {
+      "_note": "MODE (a): 'proxy first'. AppA.exe -- domains are resolved through the proxy server itself. If the proxy is unreachable, fall back to your own DNS servers (CustomDnsServers). If those are unreachable too, fall back to ordinary Windows DNS. The most private option: as long as the proxy is up, the site name never appears anywhere outside the encrypted channel to the proxy.",
+      "ProcessName": "AppA.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": true,
+      "DnsResolution": "proxy;custom;system"
+    },
+    {
+      "_note": "MODE (b): 'own DNS servers first'. AppB.exe -- resolved through CustomDnsServers (e.g. to bypass DNS-level blocking from your ISP, without touching the proxy unnecessarily). If your own DNS is unreachable, falls back to resolving through the proxy. If the proxy is also unreachable, falls back to ordinary Windows DNS.",
+      "ProcessName": "AppB.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": true,
+      "DnsResolution": "custom;proxy;system"
+    },
+    {
+      "_note": "MODE (c): 'ordinary Windows DNS first'. AppC.exe -- behaves like before in most cases (resolves through the system), but if the system DNS ever stops responding, it doesn't lose internet entirely -- it first tries your own DNS servers, and only as a last resort resolves through the proxy. Good when you want a safety net for DNS problems without changing the usual resolution behaviour unless you have to.",
+      "ProcessName": "AppC.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": true,
+      "DnsResolution": "system;custom;proxy"
+    },
+    {
+      "_note": "You don't have to list all three sources -- e.g. just 'proxy' alone, with no fallback at all, if you want it strict: either resolve through the proxy, or the app gets no DNS answer at all (and, correspondingly, can't connect anywhere). Left disabled here (IsEnabled=false) just for reference.",
+      "ProcessName": "AppD.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": false,
+      "DnsResolution": "proxy"
+    },
+    {
+      "_note": "Everything else -- direct, no DNS interference at all.",
+      "ProcessName": "*",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "DIRECT",
+      "ProxyConfigId": 0,
+      "IsEnabled": true
+    }
+  ]
+}

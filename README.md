@@ -1,0 +1,123 @@
+# Extended ProxyBridge
+
+A fork of [ProxyBridge](https://github.com/InterceptSuite/ProxyBridge) by
+Sourav Kalal / InterceptSuite, adding Windows service support, automatic
+proxy failover, configurable DNS resolution (including resolving through
+the proxy itself), and rename-friendly builds.
+
+ProxyBridge transparently routes selected Windows applications' traffic
+through a SOCKS5 or HTTP proxy at the kernel level, via
+[WinDivert](https://github.com/basil00/WinDivert) packet interception —
+no per-application proxy configuration needed, and no TUN adapter.
+
+This fork keeps everything the original project already does (per-process
+and per-path rules, host/port wildcards, domain-based rules, TCP/UDP) and
+adds the features below.
+
+## What this fork adds
+
+- **Windows service support** — install/start/stop/uninstall as a proper
+  Windows service, with a customizable service name and description. Runs
+  headless, no open console needed, starts automatically on boot.
+- **Automatic failover** — chain multiple proxy configs together; a
+  background health-check thread detects when one goes down and switches
+  traffic to the next one in the chain automatically, then switches back
+  once it recovers.
+- **Configurable DNS resolution**, per rule, with three interchangeable
+  sources and a priority order you choose:
+  - `proxy` — the domain is never resolved locally at all. The application
+    is handed a throwaway address from the 198.18.0.0/15 range (RFC 2544
+    benchmark range, non-routable, the same convention used by
+    Clash/V2Ray/Xray for this exact purpose); the real lookup happens on
+    the proxy server itself via a SOCKS5 domain-based CONNECT.
+  - `custom` — resolved through your own DNS servers, via a hand-rolled
+    DNS client (Windows doesn't expose a supported way to point
+    `getaddrinfo()` at a specific server).
+  - `system` — whatever DNS servers Windows itself is configured with
+    (today's default behaviour if this field is left unset).
+- **Rename-friendly builds** — rename the .exe to anything, rename the
+  matching .dll to the same name, and it just works. No hardcoded file
+  names, no recompiling.
+
+## Status / how far this has been tested
+
+Everything above was actually compiled with `x86_64-w64-mingw32-gcc`
+(cross-compiled from Linux) and, where possible, exercised against real
+sockets under Wine: health-check detection against a live/dead TCP
+listener, the hand-rolled DNS client against a real DNS server (including
+correctly handling NXDOMAIN), the service install/start/stop/uninstall
+cycle against Wine's Service Control Manager, and full `.pbprofile` →
+CLI → DLL wiring for every feature above.
+
+**What could not be tested in that environment, and needs verification on
+real Windows before you rely on it:** the actual WinDivert packet capture
+and injection path — including the DNS-query interception itself (the
+piece that hands out fake IPs and injects spoofed responses). Wine has no
+real kernel driver, so `WinDivertOpen()` always fails there. Sandbox
+testing verified the surrounding logic (packet field layouts checked
+against the real WinDivert SDK headers, DNS packet building/parsing
+tested standalone) but not live packet injection on a real network stack.
+If you hit issues, please open an issue with `--verbose 3` output.
+
+## Download / build
+
+Pre-built binaries: see [Releases](../../releases) (once published).
+
+To build yourself (Linux, cross-compiling with mingw-w64):
+
+```bash
+sudo apt install gcc-mingw-w64-x86-64
+curl -sLO https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
+unzip WinDivert-2.2.2-A.zip
+
+# Core DLL
+x86_64-w64-mingw32-gcc -std=gnu11 -shared -O2 -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS \
+  -I WinDivert-2.2.2-A/include Windows/src/ProxyBridge.c \
+  -L WinDivert-2.2.2-A/x64 -lWinDivert -lws2_32 -liphlpapi \
+  -o ProxyBridgeCore.dll
+
+# CLI
+x86_64-w64-mingw32-gcc -std=gnu11 -O2 -D_WIN32_WINNT=0x0601 \
+  Windows/cli/main.c -lwinhttp -lshell32 -ladvapi32 \
+  -o ProxyBridge_CLI.exe
+```
+
+Copy `ProxyBridgeCore.dll`, `ProxyBridge_CLI.exe`, `WinDivert.dll`, and
+`WinDivert64.sys` (from the WinDivert release zip's `x64/` folder) into
+the same directory on a Windows machine. Administrator rights are
+required (WinDivert needs kernel-level access).
+
+## Documentation
+
+- [`docs/README.txt`](docs/README.txt) — full manual: every CLI command,
+  every `.pbprofile` field, walkthroughs for every usage scenario,
+  troubleshooting.
+- [`profiles/`](profiles) — seven annotated example `.pbprofile` files
+  covering single-app proxying, multiple proxies, path-based rules,
+  domain-based routing, blocking + LAN exceptions, automatic failover,
+  and the three DNS resolution priority modes.
+- [`NOTICE.md`](NOTICE.md) — summary of what's new in this fork versus
+  upstream ProxyBridge.
+
+## Configuration format
+
+Config files are plain JSON (`.pbprofile`). See
+[`docs/README.txt`](docs/README.txt) for the full field reference, or
+jump straight to the [`profiles/`](profiles) folder for working examples
+with inline explanations.
+
+## License
+
+MIT, same as upstream ProxyBridge — see [`LICENSE`](LICENSE). This is a
+fork, not an original work from scratch; full credit to
+[InterceptSuite/ProxyBridge](https://github.com/InterceptSuite/ProxyBridge)
+for the original project this builds on.
+
+## Known limitations / roadmap
+
+- Proxy chaining (e.g. HTTP → SOCKS5 → HTTP through two hops) is designed
+  but not yet implemented.
+- DNS interception is unverified on real hardware (see Status above).
+- IPv6 fake-IP addresses (AAAA queries) are not handled yet — the `proxy`
+  DNS source only answers A queries; the application falls back to its
+  own IPv4 path.

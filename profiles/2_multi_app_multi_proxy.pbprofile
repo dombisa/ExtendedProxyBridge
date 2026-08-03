@@ -1,0 +1,63 @@
+{
+  "_readme": "SCENARIO 2: SEVERAL PROXIES AT ONCE. Two different proxy servers running in parallel, different apps use different ones. Example: a work VPN client through one SOCKS5, a torrent client through a separate HTTP proxy with a login and password. Everything else — direct.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+
+  "ProxyConfigs": [
+    {
+      "_note": "Proxy #1 (Id=1) — SOCKS5, no authentication. Referenced by the browser rule below.",
+      "Id": 1,
+      "Type": "SOCKS5",
+      "Host": "10.0.0.5",
+      "Port": "1080",
+      "Username": "",
+      "Password": ""
+    },
+    {
+      "_note": "Proxy #2 (Id=2) — HTTP proxy WITH authentication (username/password). Username/Password can be left empty if the proxy is open.",
+      "Id": 2,
+      "Type": "HTTP",
+      "Host": "203.0.113.10",
+      "Port": "8080",
+      "Username": "myuser",
+      "Password": "mypassword"
+    }
+  ],
+
+  "ProxyRules": [
+    {
+      "_note": "Firefox goes through proxy #1 (SOCKS5, 10.0.0.5:1080).",
+      "ProcessName": "firefox.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": true
+    },
+    {
+      "_note": "qBittorrent goes through proxy #2 (HTTP with login, 203.0.113.10:8080). IMPORTANT: HTTP proxies don't support UDP, so Protocol=TCP here, not BOTH — otherwise ProxyBridge itself would silently let the UDP part of this rule's traffic go direct (see code: for HTTP-type proxies, UDP traffic is forced to DIRECT).",
+      "ProcessName": "qbittorrent.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "TCP",
+      "Action": "PROXY",
+      "ProxyConfigId": 2,
+      "IsEnabled": true
+    },
+    {
+      "_note": "Everything else — direct, no proxy.",
+      "ProcessName": "*",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "DIRECT",
+      "ProxyConfigId": 0,
+      "IsEnabled": true
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "_readme": "SCENARIO 3: TWO COPIES OF THE SAME PROGRAM WITH THE SAME NAME, IN DIFFERENT FOLDERS. For example, two installs of the same game/launcher (game.exe) — a work copy in one folder, a test copy in another — and only one of them should go through the proxy. Key point: if ProcessName contains a backslash, ProxyBridge compares the FULL PATH, not just the filename. Without a backslash, it compares filename only (as in scenarios 1 and 2), and both copies would look identical.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+
+  "ProxyConfigs": [
+    {
+      "_note": "The only proxy in this profile.",
+      "Id": 1,
+      "Type": "SOCKS5",
+      "Host": "127.0.0.1",
+      "Port": "1080",
+      "Username": "",
+      "Password": ""
+    }
+  ],
+
+  "ProxyRules": [
+    {
+      "_note": "IMPORTANT: ProcessName has the FULL PATH (with a backslash) — that's exactly why the exact-path comparison kicks in instead of just matching by filename. Only this specific copy of game.exe goes through the proxy.",
+      "ProcessName": "C:\\Games\\WorkCopy\\game.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": true
+    },
+    {
+      "_note": "The second copy of the same game, in a different folder — the path is different, so the previous rule won't touch it. DIRECT is spelled out here explicitly (even though it would default to that anyway) just to make the intent obvious.",
+      "ProcessName": "C:\\Games\\TestCopy\\game.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "DIRECT",
+      "ProxyConfigId": 0,
+      "IsEnabled": true
+    },
+    {
+      "_note": "Tip for later: if we'd written just \"game.exe\" instead of the full path (no backslash), the rule would treat BOTH copies as identical — it would match whichever one it saw by name, regardless of folder. A full path with a backslash is the only way to tell them apart.",
+      "ProcessName": "*",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "DIRECT",
+      "ProxyConfigId": 0,
+      "IsEnabled": true
+    }
+  ]
+}

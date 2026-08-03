@@ -1,0 +1,54 @@
+{
+  "_readme": "SCENARIO 5: 'PROXY EVERYTHING EXCEPT EXCEPTIONS' + BLOCKING ONE APP. Three things at once: (1) one specific app gets no network access at all (Action=BLOCK), (2) the entire local network (router, NAS, printer, etc.) goes direct, bypassing the proxy, (3) absolutely everything else on the machine goes through the proxy. KEY FEATURE that makes this scenario possible: a rule where ProcessName=*, TargetHosts=*, AND TargetPorts=* all at once (i.e. no filter at all) is ALWAYS checked LAST by the program, regardless of file order. So the specific BLOCK and LAN-DIRECT rules below always 'win' over this fully-open catch-all rule, no matter where they sit in the file.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+
+  "ProxyConfigs": [
+    {
+      "_note": "The main proxy everything routes through by default.",
+      "Id": 1,
+      "Type": "SOCKS5",
+      "Host": "127.0.0.1",
+      "Port": "1080",
+      "Username": "",
+      "Password": ""
+    }
+  ],
+
+  "ProxyRules": [
+    {
+      "_note": "Complete block for a specific program — it gets no network access at all, neither direct nor via proxy. Replace the name with whatever you need.",
+      "ProcessName": "suspicious_app.exe",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "BLOCK",
+      "ProxyConfigId": 0,
+      "IsEnabled": true
+    },
+    {
+      "_note": "Local network exception: any program (ProcessName=*), but only when the destination is a private range (router, NAS, printer, other devices at home/work). TargetHosts is filled in here -- so this is NOT a fully-open wildcard rule, and gets checked in normal order rather than deferred to the end. Covers 192.168.x.x, 10.x.x.x, and 172.16.x.x-172.31.x.x (spelled out as separate /16 blocks for precision).",
+      "ProcessName": "*",
+      "TargetHosts": "192.168.*.*;10.*.*.*;172.16.*.*;172.17.*.*;172.18.*.*;172.19.*.*;172.20.*.*;172.21.*.*;172.22.*.*;172.23.*.*;172.24.*.*;172.25.*.*;172.26.*.*;172.27.*.*;172.28.*.*;172.29.*.*;172.30.*.*;172.31.*.*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "DIRECT",
+      "ProxyConfigId": 0,
+      "IsEnabled": true
+    },
+    {
+      "_note": "Fully-open catch-all rule: ProcessName=*, TargetHosts=*, TargetPorts=* -- no filters at all. That's exactly why the program checks it last, after every rule above. Any traffic that isn't blocked and isn't local goes through proxy Id=1.",
+      "ProcessName": "*",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "BOTH",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": true
+    }
+  ]
+}

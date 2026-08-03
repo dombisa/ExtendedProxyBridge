@@ -1,0 +1,6492 @@
+#include <winsock2.h>
+#include <windows.h>
+#include "ProxyBridge.h"
+#include <ws2tcpip.h>
+#include <mstcpip.h>
+#include <iphlpapi.h>
+#include <psapi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "windivert.h"
+
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+
+#define MAXBUF 0xFFFF
+#define LOCAL_PROXY_PORT 34010
+#define LOCAL_UDP_RELAY_PORT 34011  // its running UDP port still make sure to not run on same port as TCP, opening same port and tcp and udp cause issue and handling port at relay server response injection
+#define MAX_PROCESS_NAME 1024
+#define VERSION "4.0.11-Beta"
+#define PID_CACHE_SIZE 1024
+#define PID_CACHE_TTL_MS 30000
+// Single packet-processor thread eliminates TCP packet reordering.
+// With multiple threads each racing to WinDivertRecv+WinDivertSend, thread N+1
+// can re-inject its segment before thread N injects segment N, causing the
+// relay's TCP stack to send DUPACKs back to the browser.  The browser
+// interprets 3+ DUPACKs as loss, halves its congestion window, and upload
+// throughput collapses 50% A single ordered thread prevents this entirely.
+// One thread is fast enough at 200 Mbps with 1460-byte segments there are
+// 17 000 packets/sec a single core processes well over 200000 packets/sec.
+#define NUM_PACKET_THREADS 1
+#define CONNECTION_HASH_SIZE 4096
+#define SOCKS5_BUFFER_SIZE 1024
+#define HTTP_BUFFER_SIZE 1024
+#define FILTER_BUFFER_SIZE 1024
+#define LOG_BUFFER_SIZE 1024
+#define MAX_LIST_SIZE 65536  // max byte length for semicolon-delimited host/port/process lists
+
+typedef struct PROCESS_RULE {
+    UINT32 rule_id;
+    char process_name[MAX_PROCESS_NAME];
+    char *target_hosts;   // Dynamic: IP filter "*", "192.168.*.*", "10.0.0.1;172.16.0.0"
+    char *target_ports;   // Dynamic: Port filter "*", "80", "80;443", "8000-9000"
+    char *target_domains; // Dynamic: Domain filter "*", "google.com", "*.google.com;*.gstatic.com" ("" or "*" = no domain restriction)
+    RuleProtocol protocol;  // TCP, UDP, or BOTH
+    RuleAction action;
+    UINT32 proxy_config_id;  // Which proxy config to route this rule through (0 = first available)
+    BOOL enabled;
+    UINT8 dns_resolution[3];       // Ordered DNS_SOURCE priority list (Extended ProxyBridge). Empty = don't intercept DNS at all (today's default behaviour).
+    UINT8 dns_resolution_count;    // 0..3
+    struct PROCESS_RULE *next;
+} PROCESS_RULE;
+
+#define SOCKS5_VERSION 0x05
+#define SOCKS5_CMD_CONNECT 0x01
+#define SOCKS5_CMD_UDP_ASSOCIATE 0x03
+#define SOCKS5_ATYP_IPV4   0x01
+#define SOCKS5_ATYP_IPV6   0x04
+#define SOCKS5_ATYP_DOMAIN 0x03  // send hostname to proxy rfc 1928
+#define SOCKS5_AUTH_NONE   0x00
+
+// DNS snooping cache: maps intercepted A-record answers to their hostnames so
+// that SOCKS5 conect can forward ATYP_DOMAIN instead of ATYP_IPV4, letting
+// proxy servers that do their own name-resolution (e.g. mihomo) see the
+// original hostname rather than a bare IP.  (Resolves issue #138.)
+#define DNS_CACHE_BUCKETS 1024
+#define DNS_CACHE_TTL_MS  300000  // 5 minutes
+
+typedef struct DNS_CACHE_ENTRY {
+    UINT32 ip;              // network-byte-order IPv4 
+    char   domain[256];
+    ULONGLONG expire_tick;
+    struct DNS_CACHE_ENTRY *next;
+} DNS_CACHE_ENTRY;
+
+typedef struct DNS_CACHE_ENTRY_V6 {
+    UINT8  ip6[16];         // raw IPv6 address
+    char   domain[256];
+    ULONGLONG expire_tick;
+    struct DNS_CACHE_ENTRY_V6 *next;
+} DNS_CACHE_ENTRY_V6;
+
+typedef struct CONNECTION_INFO {
+    UINT16 src_port;
+    UINT32 src_ip;
+    UINT32 orig_dest_ip;
+    UINT16 orig_dest_port;
+    BOOL   is_tracked;
+    ULONGLONG last_activity;
+    UINT32 proxy_config_id;
+    BOOL   is_ipv6;
+    UINT8  src_ip6[16];        // raw IPv6 src (only valid when is_ipv6)
+    UINT8  orig_dest_ip6[16];  // raw IPv6 dest (only valid when is_ipv6)
+    struct CONNECTION_INFO *next;
+} CONNECTION_INFO;
+
+typedef struct {
+    SOCKET client_socket;
+    UINT32 orig_dest_ip;
+    UINT16 orig_dest_port;
+    UINT32 proxy_config_id;
+    BOOL   is_ipv6;
+    UINT8  orig_dest_ip6[16];
+} CONNECTION_CONFIG;
+
+typedef struct {
+    SOCKET from_socket;
+    SOCKET to_socket;
+} TRANSFER_CONFIG;
+
+// Two-thread bidirectional relay: each direction runs in its own thread so
+// a slow proxy (upload) never stalls the download pipe and vice-versa.
+typedef struct {
+    SOCKET sock_client;   // app-side socket
+    SOCKET sock_proxy;    // proxy-side socket
+    volatile LONG refs;   // ref-count; last thread out closes both sockets
+} RELAY_PAIR;
+
+typedef struct {
+    RELAY_PAIR *pair;
+    SOCKET from;
+    SOCKET to;
+} ONE_WAY_CONFIG;
+
+// Track logged connections to avoid dupli
+typedef struct LOGGED_CONNECTION {
+    DWORD pid;
+    UINT32 dest_ip;
+    UINT16 dest_port;
+    RuleAction action;
+    struct LOGGED_CONNECTION *next;
+} LOGGED_CONNECTION;
+
+// Impoved slow speed due to PID checking // Added pid cache
+typedef struct PID_CACHE_ENTRY {
+    UINT32 src_ip;
+    UINT16 src_port;
+    DWORD pid;
+    DWORD timestamp;
+    BOOL is_udp;
+    struct PID_CACHE_ENTRY *next;
+} PID_CACHE_ENTRY;
+
+// Internal proxy configuration with per-config UDP SOCKS5 state
+typedef struct {
+    UINT32 config_id;           // Unique ID (1-based), 0 = unused slot
+    ProxyType type;
+    char host[256];
+    UINT16 port;
+    char username[256];
+    char password[256];
+    UINT32 resolved_ip;         // cached at add/edit time - avoids DNS per connection
+    ULONGLONG last_udp_attempt;
+    SOCKET udp_tcp_ctrl;
+    SOCKET udp_send_sock;
+    struct sockaddr_in udp_relay_addr;
+    BOOL udp_connected;
+
+    // ── Failover (Extended ProxyBridge) ─────────────────────────────────────
+    UINT32 fallback_config_id;  // 0 = no fallback link. Set via ProxyBridge_SetProxyFallback.
+    volatile LONG is_healthy;   // 1 = last health check passed (or never checked yet). Atomic; no lock needed.
+} PROXY_CONFIG;
+
+static PROXY_CONFIG g_proxy_configs[MAX_PROXY_CONFIGS];
+static int g_proxy_config_count = 0;
+static UINT32 g_next_config_id = 1;
+
+// ── Failover health-check (Extended ProxyBridge) ────────────────────────────
+// Off by default: existing profiles that never call ProxyBridge_SetHealthCheckEnabled
+// see zero behaviour change, since find_healthy_proxy_config() falls straight through
+// to find_proxy_config() while g_healthcheck_enabled is FALSE.
+static volatile BOOL g_healthcheck_enabled     = FALSE;
+static UINT32        g_healthcheck_interval_sec = 30;
+static HANDLE         g_healthcheck_thread      = NULL;
+static HANDLE         g_healthcheck_stop_event  = NULL;
+
+// ── DNS resolution policy (Extended ProxyBridge) ────────────────────────────
+// Three interchangeable resolution "sources" a rule can list, in priority
+// order, via ProxyBridge_SetRuleDnsResolution(). Absent = today's behaviour
+// unchanged (application resolves for itself, we never intercept its DNS).
+typedef enum {
+    DNS_SRC_SYSTEM = 0,  // whatever Windows itself is configured to use (existing resolve_hostname())
+    DNS_SRC_CUSTOM = 1,  // our own hand-rolled DNS client against ProxyBridge_SetCustomDnsServers list
+    DNS_SRC_PROXY  = 2   // resolved remotely BY the proxy server itself (fake-IP technique - see fake-IP pool below)
+} DNS_SOURCE;
+
+#define MAX_CUSTOM_DNS_SERVERS 8
+typedef struct {
+    UINT32 ip;    // network byte order, like everywhere else in this file
+    UINT16 port;  // usually 53
+} CUSTOM_DNS_SERVER;
+
+static CUSTOM_DNS_SERVER g_custom_dns_servers[MAX_CUSTOM_DNS_SERVERS];
+static int               g_custom_dns_server_count = 0;
+
+// ── Fake-IP pool (Extended ProxyBridge) ─────────────────────────────────────
+// Backing store for DNS_SRC_PROXY: when a rule's DNS policy asks for "proxy"
+// resolution, we do NOT resolve the domain ourselves at all - we hand the
+// application a throwaway address from this pool and register it in the
+// EXISTING DNS snoop cache (dns_cache_store/dns_cache_lookup, above) under
+// that domain. That's deliberate reuse, not a new parallel structure: the
+// connection-relay code already calls dns_cache_lookup() on the destination
+// IP and, when it finds a cached domain, sends a domain-based SOCKS5 CONNECT
+// (socks5_connect_domain(), which already exists) instead of an IP-based one
+// - letting the proxy server do the real DNS lookup. So allocating a fake IP
+// and dns_cache_store()-ing it under the real domain is *already* enough to
+// make "resolve via proxy" work all the way through to the real connection,
+// with zero changes needed to the relay/connect path itself.
+//
+// What's still missing (separate, not-yet-implemented step): actually
+// answering the application's own DNS query with one of these addresses,
+// which requires intercepting its outbound UDP:53 packet at the WinDivert
+// level and injecting a synthesized response. fake_ip_alloc() below is the
+// piece that step will call once that interception exists.
+//
+// Range: 198.18.0.0/15 (RFC 2544 benchmark-testing range - never routable on
+// a real network, and already the de-facto convention used by mainstream
+// tools like Clash/V2Ray/Xray/sing-box for exactly this purpose, which keeps
+// this about as unremarkable to AV heuristics as this technique can be).
+#define FAKE_IP_COUNT 131072u  // 198.18.0.0/15 = 2^17 addresses
+static volatile LONG g_fake_ip_counter = 0; // round-robin allocation cursor
+
+static CONNECTION_INFO *connection_hash_table[CONNECTION_HASH_SIZE] = {NULL};
+static LOGGED_CONNECTION *logged_connections = NULL;
+static int g_logged_count = 0;  // running length of logged_connections (guarded by `lock`)
+static PROCESS_RULE *rules_list = NULL;
+static UINT32 g_next_rule_id = 1;
+static SRWLOCK lock;
+// Fix added via Claude - The eror due to lack of gaurd case is causing leak in few cases, unwated different thread accessing the same data structure, so added a lock to gaurd the connection hash table and pid cache
+// Guards rules_list and the rule nodes/strings it points to. Separate from `lock`
+// (which guards the connection table + PID cache) so rule edits from the GUI thread
+// never block the packet path's connection bookkeeping. A zero-initialised SRWLOCK is
+// already in the valid unlocked state, so this is safe to use before ProxyBridge_Start.
+static SRWLOCK g_rules_lock;
+static HANDLE windivert_handle = INVALID_HANDLE_VALUE;
+static HANDLE packet_thread[NUM_PACKET_THREADS] = {NULL};
+static HANDLE proxy_thread = NULL;
+static HANDLE udp_relay_thread = NULL;
+static HANDLE cleanup_thread = NULL;
+static PID_CACHE_ENTRY *pid_cache[PID_CACHE_SIZE] = {NULL};
+static volatile BOOL g_has_active_rules = FALSE;
+// Set when at least one enabled rule carries a domain filter. Gates the DNS-cache
+// lookup in match_rule so setups without domain rules pay zero extra cost.
+static volatile BOOL g_has_domain_rules = FALSE;
+static SOCKET udp_relay_socket = INVALID_SOCKET;
+static SOCKET udp_relay_socket6 = INVALID_SOCKET;
+static volatile BOOL running = FALSE;
+static DWORD g_current_process_id = 0;
+
+static BOOL g_traffic_logging_enabled = TRUE;
+
+static DNS_CACHE_ENTRY    *g_dns_cache[DNS_CACHE_BUCKETS];
+static DNS_CACHE_ENTRY_V6 *g_dns_cache_v6[DNS_CACHE_BUCKETS];
+static SRWLOCK             g_dns_cache_lock;
+
+// per src port decision cache.
+//
+// check_process_rule() resolves (src_port) to DIRECT, PROXY, or BLOCK,
+// every subsequent packet from that port gets the cached answer in 5 cycles
+// (one atomic read). this is needed else every outbound data/ack segment from an
+// established connection re runs the full check_process_rule() path:
+//   GetExtendedTcpTable (malloc + kernel roundtrip)
+//   + OpenProcess + QueryFullProcessImageName
+//   + rule list walk
+// On a sustained 300 Mbps download (17 000 packets/sec) that is thousands of
+// kernel calls per second, saturating a single core.
+//
+// Layout: two 2048-LONG bitmaps, 8 KB each.
+//   port_decided_bitmap : bit set = decision is cached for this port
+//   port_direct_bitmap  : bit set = decision was DIRECT (bit clear = PROXY/BLOCK)
+// Together they encode three states per port:
+//   decided=0            -> no cached decision, call check_process_rule
+//   decided=1, direct=1  -> DIRECT, pass packet unchanged
+//   decided=1, direct=0  -> already added to connection (PROXY/BLOCK handled)
+//
+// Thread safety: InterlockedOr/And for writes; plain aligned 32-bit read for
+// reads (x86/x64 aligned read is atomic; we only need visibility, not ordering).
+static volatile LONG port_decided_bitmap[2048] = {0};  // 8 KB
+static volatile LONG port_direct_bitmap[2048]  = {0};  // 8 KB
+
+static inline BOOL port_is_decided(UINT16 p)
+{
+    return (port_decided_bitmap[p >> 5] >> (p & 31)) & 1;
+}
+static inline BOOL port_is_direct(UINT16 p)
+{
+    return (port_direct_bitmap[p >> 5] >> (p & 31)) & 1;
+}
+static inline void port_set_direct(UINT16 p)
+{
+    InterlockedOr(&port_decided_bitmap[p >> 5], (LONG)(1u << (p & 31)));
+    InterlockedOr(&port_direct_bitmap[p >> 5],  (LONG)(1u << (p & 31)));
+}
+static inline void port_set_decided(UINT16 p)  // decided, but NOT direct (proxy/block)
+{
+    InterlockedOr(&port_decided_bitmap[p >> 5], (LONG)(1u << (p & 31)));
+    // leave port_direct_bitmap bit at 0
+}
+static inline void port_clear(UINT16 p)
+{
+    InterlockedAnd(&port_decided_bitmap[p >> 5], (LONG)~(1u << (p & 31)));
+    InterlockedAnd(&port_direct_bitmap[p >> 5],  (LONG)~(1u << (p & 31)));
+}
+
+static UINT16 g_local_relay_port = LOCAL_PROXY_PORT;
+static BOOL g_localhost_via_proxy = FALSE;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
+static LogCallback g_log_callback = NULL;
+static ConnectionCallback g_connection_callback = NULL;
+
+static void log_message(const char *msg, ...)
+{
+    if (g_log_callback == NULL) return;
+    char buffer[LOG_BUFFER_SIZE];
+    va_list args;
+    va_start(args, msg);
+    vsnprintf(buffer, sizeof(buffer), msg, args);
+    va_end(args);
+    g_log_callback(buffer);
+}
+
+// Extract filename from full path  C:\path\chrome.exe  >> chrome.exe
+static const char* extract_filename(const char* path)
+{
+    if (!path) return "";
+    const char* last_backslash = strrchr(path, '\\');
+    const char* last_slash = strrchr(path, '/');
+    const char* last_separator = (last_backslash > last_slash) ? last_backslash : last_slash;
+    return last_separator ? (last_separator + 1) : path;
+}
+
+static inline char* skip_whitespace(char *str)
+{
+    while (*str == ' ' || *str == '\t')
+        str++;
+    return str;
+}
+
+static void format_ip_address(UINT32 ip, char *buffer, size_t size)
+{
+    snprintf(buffer, size, "%d.%d.%d.%d",
+        (ip >> 0) & 0xFF, (ip >> 8) & 0xFF,
+        (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
+}
+
+typedef BOOL (*token_match_func)(const char *token, const void *data);
+
+static BOOL parse_token_list(const char *list, const char *delimiters, token_match_func match_func, const void *match_data)
+{
+    if (list == NULL || list[0] == '\0' || strcmp(list, "*") == 0)
+        return TRUE;
+
+    // strtok_s needs a writable copy. Use a stack buffer for the common (short) case and
+    // only fall back to malloc for unusually long lists - avoids a heap alloc on the
+    // packet thread for every rule that has a specific host/port filter.
+    char   stackbuf[256];
+    size_t len    = strnlen_s(list, MAX_LIST_SIZE) + 1;
+    size_t dstsz  = len;
+    char  *list_copy;
+    BOOL   on_heap = FALSE;
+    if (len <= sizeof(stackbuf))
+    {
+        list_copy = stackbuf;
+        dstsz     = sizeof(stackbuf);
+    }
+    else
+    {
+        list_copy = (char *)malloc(len);
+        if (list_copy == NULL)
+            return FALSE;
+        on_heap = TRUE;
+    }
+
+    strncpy_s(list_copy, dstsz, list, _TRUNCATE);
+    BOOL matched = FALSE;
+    char *context = NULL;
+    char *token = strtok_s(list_copy, delimiters, &context);
+    while (token != NULL)
+    {
+        token = skip_whitespace(token);
+        if (match_func(token, match_data))
+        {
+            matched = TRUE;
+            break;
+        }
+        token = strtok_s(NULL, delimiters, &context);
+    }
+    if (on_heap)
+        free(list_copy);
+    return matched;
+}
+
+static void configure_tcp_socket(SOCKET sock, int bufsize, DWORD timeout)
+{
+    int nodelay = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&bufsize, sizeof(bufsize));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&bufsize, sizeof(bufsize));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+}
+
+// connect() with a bounded timeout. A blocking connect() to an unreachable host stalls
+// for the OS SYN timeout (~21s on Windows), and the UDP relay runs on a single thread -
+// so one dead/unreachable proxy config would freeze the whole relay (and delay real
+// packets) while it waits. This does a non-blocking connect + select so a dead proxy
+// fails in `timeout_ms` instead. Returns 0 on success, SOCKET_ERROR otherwise.
+static int connect_with_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, int timeout_ms)
+{
+    u_long nonblock = 1;
+    ioctlsocket(s, FIONBIO, &nonblock);
+
+    int result = 0;
+    if (connect(s, addr, addrlen) == SOCKET_ERROR)
+    {
+        if (WSAGetLastError() != WSAEWOULDBLOCK)
+        {
+            result = SOCKET_ERROR;
+        }
+        else
+        {
+            fd_set wfds, efds;
+            FD_ZERO(&wfds); FD_SET(s, &wfds);
+            FD_ZERO(&efds); FD_SET(s, &efds);
+            struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+            int sel = select(0, NULL, &wfds, &efds, &tv);
+            if (sel <= 0 || FD_ISSET(s, &efds))
+            {
+                result = SOCKET_ERROR;   // timed out or connect failed
+            }
+            else
+            {
+                int so_err = 0;
+                int errlen = sizeof(so_err);
+                getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so_err, &errlen);
+                if (so_err != 0)
+                    result = SOCKET_ERROR;
+            }
+        }
+    }
+
+    u_long blocking = 0;
+    ioctlsocket(s, FIONBIO, &blocking);   // restore blocking for the handshake reads
+    return result;
+}
+
+static void configure_udp_socket(SOCKET sock, int bufsize, DWORD timeout)
+{
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&bufsize, sizeof(bufsize));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&bufsize, sizeof(bufsize));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+
+#ifdef _WIN32
+    #ifndef SIO_UDP_CONNRESET
+    #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+    #endif
+    BOOL bNewBehavior = FALSE;
+    DWORD dwBytesReturned = 0;
+    WSAIoctl(sock, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), NULL, 0, &dwBytesReturned, NULL, NULL);
+#endif
+}
+
+static int send_all(SOCKET sock, const char *buf, int len)
+{
+    int sent = 0;
+    while (sent < len) {
+        int n = send(sock, buf + sent, len - sent, 0);
+        if (n == SOCKET_ERROR) return SOCKET_ERROR;
+        sent += n;
+    }
+    return sent;
+}
+
+// Read exactly n bytes, looping over partial TCP segments. SOCKS5/HTTP replies can be
+// split across multiple segments (common on high-latency remote proxies); a single
+// recv() may return fewer bytes than requested, so the fixed-length handshake reads
+// must accumulate. Returns n on success, or SOCKET_ERROR on error / peer close.
+static int recv_n(SOCKET s, char *buf, int n)
+{
+    int got = 0;
+    while (got < n) {
+        int r = recv(s, buf + got, n - got, 0);
+        if (r <= 0) return SOCKET_ERROR;  // 0 = peer closed, <0 = error/timeout
+        got += r;
+    }
+    return n;
+}
+
+static UINT32 parse_ipv4(const char *ip);
+static UINT32 resolve_hostname(const char *hostname);
+
+// ── DNS resolution policy (Extended ProxyBridge) ────────────────────────────
+static UINT32 resolve_via_custom_dns(const char *hostname, int timeout_ms);
+static UINT32 fake_ip_alloc(const char *hostname);
+static BOOL   is_fake_ip(UINT32 ip);
+static void   dns_cache_store(UINT32 ip, const char *domain); // defined later; fake_ip_alloc needs it earlier
+static BOOL   dns_parse_name(const UINT8 *msg, int msg_len, int *offset, char *dst, int dst_len); // defined later
+static BOOL   get_dns_policy_for_process(const char *process_name, UINT8 *out_sources, UINT8 *out_count);
+static BOOL   dns_intercept_query(const unsigned char *packet, UINT packet_len, WINDIVERT_ADDRESS *addr,
+                                   PWINDIVERT_IPHDR ip_header, PWINDIVERT_UDPHDR udp_header,
+                                   const UINT8 *dns_payload, int dns_payload_len, DWORD pid);
+static PROXY_CONFIG* find_proxy_config(UINT32 config_id);
+static PROXY_CONFIG* find_healthy_proxy_config(UINT32 config_id); // Extended ProxyBridge: failover
+static BOOL any_socks5_config(void);
+static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg);
+static int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, const PROXY_CONFIG *cfg);
+static int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port, const PROXY_CONFIG *cfg);
+static int http_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, const PROXY_CONFIG *cfg);
+static BOOL dns_cache_lookup(UINT32 ip, char *out_domain, size_t out_size);
+static BOOL dns_cache_lookup_v6(const UINT8 ip6[16], char *out_domain, size_t out_size);
+static void snoop_dns_response(const UINT8 *payload, int payload_len);
+static int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, const PROXY_CONFIG *cfg);
+static BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg);
+static DWORD WINAPI udp_relay_server(LPVOID arg);
+static BOOL match_ip_pattern(const char *pattern, UINT32 ip);
+static BOOL match_port_pattern(const char *pattern, UINT16 port);
+static BOOL match_ip_list(const char *ip_list, UINT32 ip);
+static BOOL match_port_list(const char *port_list, UINT16 port);
+static BOOL match_process_pattern(const char *pattern, const char *process_name);
+static BOOL match_process_list(const char *process_list, const char *process_name);
+static BOOL match_domain_pattern(const char *pattern, const char *domain);
+static BOOL match_domain_list(const char *domain_list, const char *domain);
+static BOOL rule_has_domain_filter(const PROCESS_RULE *rule);
+static BOOL match_domain_filter(const PROCESS_RULE *rule, const char *domain);
+static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg);
+static DWORD WINAPI local_proxy_server(LPVOID arg);
+static DWORD WINAPI connection_handler(LPVOID arg);
+static DWORD WINAPI transfer_handler(LPVOID arg);
+static DWORD WINAPI packet_processor(LPVOID arg);
+static DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port);
+static DWORD get_process_id_from_connection_v6(const UINT8 src_ip6[16], UINT16 src_port);
+static DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port);
+static DWORD get_process_id_from_udp_connection_v6(const UINT8 src_ip6[16], UINT16 src_port);
+static BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size);
+static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id);
+static RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, DWORD *out_pid, UINT32 *out_proxy_config_id);
+static RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const UINT8 dest_ip6[16], UINT16 dest_port, BOOL is_udp, DWORD *out_pid, UINT32 *out_proxy_config_id);
+static RuleAction match_rule_v6(const char *process_name, const UINT8 dest_ip6[16], UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id);
+static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id);
+static void add_connection_v6(UINT16 src_port, const UINT8 src_ip6[16], const UINT8 dest_ip6[16], UINT16 dest_port, UINT32 proxy_config_id);
+static BOOL get_connection_full_v6(UINT16 src_port, UINT8 dest_ip6[16], UINT16 *dest_port, UINT32 *proxy_config_id);
+static BOOL find_v6_udp_sender(const UINT8 orig_dest_ip6[16], UINT16 orig_dest_port, UINT8 src_ip6[16], UINT16 *src_port);
+static BOOL get_connection(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port);
+static BOOL get_connection_full(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port, UINT32 *proxy_config_id);
+static UINT32 get_connection_proxy_id(UINT16 src_port);
+static BOOL is_connection_tracked(UINT16 src_port);
+static void remove_connection(UINT16 src_port);
+static void cleanup_stale_connections(void);
+static BOOL is_connection_already_logged(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action);
+static void add_logged_connection(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action);
+static void clear_logged_connections(void);
+static BOOL is_broadcast_or_multicast(UINT32 ip);
+static BOOL is_ipv6_multicast_or_linklocal(const UINT8 ip6[16]);
+static DWORD get_cached_pid(UINT32 src_ip, UINT16 src_port, BOOL is_udp);
+static void cache_pid(UINT32 src_ip, UINT16 src_port, DWORD pid, BOOL is_udp);
+static void remove_cached_pid(UINT32 src_ip, UINT16 src_port, BOOL is_udp);
+static void clear_pid_cache(void);
+static void cleanup_stale_pid_cache(void);
+static void cleanup_stale_dns_cache(void);
+static int recv_n(SOCKET s, char *buf, int n);
+static void update_has_active_rules(void);
+static void base64_encode(const char* input, char* output, size_t output_size);
+
+
+static DWORD WINAPI packet_processor(LPVOID arg)
+{
+    unsigned char packet[MAXBUF];
+    UINT packet_len;
+    WINDIVERT_ADDRESS addr;
+    PWINDIVERT_IPHDR ip_header;
+    PWINDIVERT_TCPHDR tcp_header;
+    PWINDIVERT_UDPHDR udp_header;
+
+    while (running)
+    {
+        if (!WinDivertRecv(windivert_handle, packet, sizeof(packet), &packet_len, &addr))
+        {
+            if (GetLastError() == ERROR_INVALID_HANDLE)
+                break;
+            log_message("Failed to receive packet (%lu)", GetLastError());
+            continue;
+        }
+
+        PWINDIVERT_IPV6HDR ipv6_header = NULL;
+        WinDivertHelperParsePacket(packet, packet_len, &ip_header, &ipv6_header, NULL,
+            NULL, NULL, &tcp_header, &udp_header, NULL, NULL, NULL, NULL);
+
+        if (ip_header == NULL)
+        {
+            if (ipv6_header == NULL) { continue; }
+
+            // IPv6 UDP
+            if (tcp_header == NULL && udp_header != NULL)
+            {
+                if (addr.Outbound)
+                {
+                    UINT16 sp = ntohs(udp_header->SrcPort);
+                    UINT16 dp = ntohs(udp_header->DstPort);
+
+                    // relay response: restore orig src port/addr
+                    if (sp == LOCAL_UDP_RELAY_PORT)
+                    {
+                        UINT16 client_sp = ntohs(udp_header->DstPort);
+                        UINT8  orig_dst6[16]; UINT16 orig_dp = 0; UINT32 dummy = 0;
+                        if (get_connection_full_v6(client_sp, orig_dst6, &orig_dp, &dummy))
+                        {
+                            memcpy(ipv6_header->SrcAddr, orig_dst6, 16);
+                            udp_header->SrcPort = htons(orig_dp);
+                        }
+                        // ::1 loopback: keep OUTBOUND so the loopback adapter echo
+                        // delivers reliably (same reasoning as IPv4 path below).
+                        // Non-loopback: inject INBOUND.
+                        static const UINT8 _lb6r[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+                        if (memcmp(ipv6_header->DstAddr, _lb6r, 16) != 0)
+                            addr.Outbound = FALSE;
+                        goto ipv6u_send;
+                    }
+
+                    if (is_connection_tracked(sp))
+                    {
+                        udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+                        static const UINT8 _lb6u2[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+                        BOOL both_lb=(memcmp(ipv6_header->SrcAddr,_lb6u2,16)==0&&memcmp(ipv6_header->DstAddr,_lb6u2,16)==0);
+                        if (!both_lb)
+                        {
+                            UINT32 tmp[4];
+                            memcpy(tmp,ipv6_header->DstAddr,16);
+                            memcpy(ipv6_header->DstAddr,ipv6_header->SrcAddr,16);
+                            memcpy(ipv6_header->SrcAddr,tmp,16);
+                            addr.Outbound = FALSE;
+                        }
+                        goto ipv6u_send;
+                    }
+
+                    if (is_ipv6_multicast_or_linklocal((const UINT8*)ipv6_header->DstAddr))
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+
+                    if (!g_has_active_rules && g_connection_callback == NULL)
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+
+                    RuleAction action6u;
+                    DWORD pid6u = 0;
+                    UINT32 pcid6u = 0;
+                    action6u = check_process_rule_v6((const UINT8*)ipv6_header->SrcAddr, sp, (const UINT8*)ipv6_header->DstAddr, dp, TRUE, &pid6u, &pcid6u);
+
+                    if (action6u == RULE_ACTION_PROXY && !g_localhost_via_proxy)
+                    {
+                        const UINT8 *d6=(const UINT8*)ipv6_header->DstAddr;
+                        static const UINT8 lb6[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+                        static const UINT8 v4p[12]={0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+                        if (memcmp(d6,lb6,16)==0||(memcmp(d6,v4p,12)==0&&d6[12]==127))
+                            action6u = RULE_ACTION_DIRECT;
+                    }
+
+                    // Override PROXY to DIRECT for DHCPv6 ports (546=client, 547=server)
+                    if (action6u == RULE_ACTION_PROXY && (dp == 546 || dp == 547))
+                        action6u = RULE_ACTION_DIRECT;
+
+                    if (g_connection_callback != NULL && pid6u > 0)
+                    {
+                        // Fold the 128-bit destination into a 32-bit key so the log-dedup
+                        // table distinguishes different IPv6 hosts. Passing 0 (as before)
+                        // collapsed every IPv6 destination on the same port/action into one
+                        // key, causing distinct hosts to be dropped as duplicates.
+                        const UINT32 *dw6 = (const UINT32 *)ipv6_header->DstAddr;
+                        UINT32 v6key = dw6[0] ^ dw6[1] ^ dw6[2] ^ dw6[3];
+
+                        char pname[MAX_PROCESS_NAME];
+                        if (get_process_name_from_pid(pid6u, pname, sizeof(pname)))
+                        {
+                            if (!is_connection_already_logged(pid6u, v6key, dp, action6u))
+                            {
+                                char dstr[64];
+                                inet_ntop(AF_INET6, ipv6_header->DstAddr, dstr, sizeof(dstr));
+                                char pinfo[128];
+                                if (action6u==RULE_ACTION_PROXY){PROXY_CONFIG*pc=find_proxy_config(pcid6u);if(pc)snprintf(pinfo,sizeof(pinfo),"Proxy %s://%s:%d (UDP)",pc->type==PROXY_TYPE_HTTP?"HTTP":"SOCKS5",pc->host,pc->port);else snprintf(pinfo,sizeof(pinfo),"Proxy (UDP)");}
+                                else if(action6u==RULE_ACTION_DIRECT) snprintf(pinfo,sizeof(pinfo),"Direct (UDP)");
+                                else snprintf(pinfo,sizeof(pinfo),"Blocked (UDP)");
+                                g_connection_callback(extract_filename(pname),pid6u,dstr,dp,pinfo);
+                                if(g_traffic_logging_enabled) add_logged_connection(pid6u,v6key,dp,action6u);
+                            }
+                        }
+                    }
+
+                    if (action6u == RULE_ACTION_BLOCK) continue;
+
+                    if (action6u == RULE_ACTION_PROXY)
+                    {
+                        PROXY_CONFIG *pc6u = find_proxy_config(pcid6u);
+                        if (pc6u == NULL || pc6u->type != PROXY_TYPE_SOCKS5)
+                        {
+                            // HTTP proxy can't relay UDP - drop
+                            continue;
+                        }
+                        add_connection_v6(sp, (const UINT8*)ipv6_header->SrcAddr, (const UINT8*)ipv6_header->DstAddr, dp, pcid6u);
+
+                        udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+                        static const UINT8 _lb6up[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+                        BOOL both_lb=(memcmp(ipv6_header->SrcAddr,_lb6up,16)==0&&memcmp(ipv6_header->DstAddr,_lb6up,16)==0);
+                        if (both_lb)
+                        {
+                            memset(ipv6_header->DstAddr, 0, 16);
+                            ((UINT8*)ipv6_header->DstAddr)[15] = 1;
+                        }
+                        else
+                        {
+                            UINT32 tmp[4];
+                            memcpy(tmp, ipv6_header->DstAddr, 16);
+                            memcpy(ipv6_header->DstAddr, ipv6_header->SrcAddr, 16);
+                            memcpy(ipv6_header->SrcAddr, tmp, 16);
+                            addr.Outbound = FALSE;
+                        }
+                        goto ipv6u_send;
+                    }
+                    else
+                    {
+                        // DIRECT (or no matching rule): unmodified packet, send as-is without
+                        // recomputing checksums (wasteful + can clash with NIC offload, #161).
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                }
+                else
+                {
+                    if (udp_header->DstPort != htons(LOCAL_UDP_RELAY_PORT))
+                    {
+                        // Snoop IPv6 DNS responses (AAAA records) for the domain cache.
+                        if (ntohs(udp_header->SrcPort) == 53)
+                        {
+                            const UINT8 *udp_payload6 = (const UINT8 *)udp_header + sizeof(WINDIVERT_UDPHDR);
+                            int udp_payload6_len = (int)(ntohs(udp_header->Length) - sizeof(WINDIVERT_UDPHDR));
+                            if (udp_payload6_len > 0)
+                                snoop_dns_response(udp_payload6, udp_payload6_len);
+                        }
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                }
+
+            ipv6u_send:
+                WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
+                WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                continue;
+            }
+
+            // IPv6 TCP only below
+            if (tcp_header == NULL)
+            {
+                WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                continue;
+            }
+
+            if (addr.Outbound)
+            {
+                UINT16 sp = ntohs(tcp_header->SrcPort);
+                UINT16 dp = ntohs(tcp_header->DstPort);
+
+                if (port_is_decided(sp))
+                {
+                    if (tcp_header->Fin || tcp_header->Rst) port_clear(sp);
+                    if (port_is_direct(sp))
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                }
+
+                // relay response: restore original src port and fix up addresses
+                if (sp == (UINT16)g_local_relay_port)
+                {
+                    UINT16 client_sp = ntohs(tcp_header->DstPort);
+                    UINT8  orig_dst6[16];
+                    UINT16 orig_dst_port = 0;
+                    UINT32 dummy_cfg = 0;
+                    get_connection_full_v6(client_sp, orig_dst6, &orig_dst_port, &dummy_cfg);
+                    if (orig_dst_port) tcp_header->SrcPort = htons(orig_dst_port);
+
+                    static const UINT8 _lb6[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+                    BOOL both_lb = (memcmp(ipv6_header->SrcAddr, _lb6, 16) == 0 &&
+                                    memcmp(ipv6_header->DstAddr, _lb6, 16) == 0);
+                    if (!both_lb)
+                    {
+                        UINT32 tmp[4];
+                        memcpy(tmp, ipv6_header->DstAddr, 16);
+                        memcpy(ipv6_header->DstAddr, ipv6_header->SrcAddr, 16);
+                        memcpy(ipv6_header->SrcAddr, tmp, 16);
+                        addr.Outbound = FALSE;
+                    }
+                    if (tcp_header->Fin || tcp_header->Rst) remove_connection(client_sp);
+                    goto ipv6_send;
+                }
+
+                if (is_connection_tracked(sp))
+                {
+                    if (tcp_header->Fin || tcp_header->Rst) { remove_connection(sp); port_clear(sp); }
+                    tcp_header->DstPort = htons(g_local_relay_port);
+
+                    static const UINT8 _lb6t[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+                    BOOL both_lb = (memcmp(ipv6_header->SrcAddr, _lb6t, 16) == 0 &&
+                                    memcmp(ipv6_header->DstAddr, _lb6t, 16) == 0);
+                    if (!both_lb)
+                    {
+                        UINT32 tmp[4];
+                        memcpy(tmp, ipv6_header->DstAddr, 16);
+                        memcpy(ipv6_header->DstAddr, ipv6_header->SrcAddr, 16);
+                        memcpy(ipv6_header->SrcAddr, tmp, 16);
+                        addr.Outbound = FALSE;
+                    }
+                    goto ipv6_send;
+                }
+
+                // skip multicast/link-local
+                if (is_ipv6_multicast_or_linklocal((const UINT8*)ipv6_header->DstAddr))
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+
+                if (!g_has_active_rules && g_connection_callback == NULL)
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+
+                RuleAction action6;
+                DWORD pid6 = 0;
+                UINT32 proxy_config_id6 = 0;
+                action6 = check_process_rule_v6((const UINT8*)ipv6_header->SrcAddr, sp, (const UINT8*)ipv6_header->DstAddr, dp, FALSE, &pid6, &proxy_config_id6);
+
+                // ::1 IPv6 loopback - use  same "Localhost via Proxy" toggle as IPv4 127.
+                if (action6 == RULE_ACTION_PROXY && !g_localhost_via_proxy)
+                {
+                    const UINT8 *dst6 = (const UINT8*)ipv6_header->DstAddr;
+                    // check for ::1 (loopback) or ::ffff:127.x.x.x (v4-mapped loopback)
+                    static const UINT8 loopback6[16] = {0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1};
+                    static const UINT8 v4mapped_pfx[12] = {0,0,0,0, 0,0,0,0, 0,0,0xff,0xff};
+                    BOOL is_lb6 = (memcmp(dst6, loopback6, 16) == 0);
+                    BOOL is_v4mapped_lb = (!is_lb6 && memcmp(dst6, v4mapped_pfx, 12) == 0 && dst6[12] == 127);
+                    if (is_lb6 || is_v4mapped_lb)
+                        action6 = RULE_ACTION_DIRECT;
+                }
+
+                if (g_connection_callback != NULL && tcp_header->Syn && !tcp_header->Ack && pid6 > 0)
+                {
+                    // Fold the 128-bit destination into a 32-bit dedup key so different
+                    // IPv6 hosts aren't collapsed into one entry (see IPv6 UDP path).
+                    const UINT32 *dw6 = (const UINT32 *)ipv6_header->DstAddr;
+                    UINT32 v6key = dw6[0] ^ dw6[1] ^ dw6[2] ^ dw6[3];
+
+                    char process_name[MAX_PROCESS_NAME];
+                    if (get_process_name_from_pid(pid6, process_name, sizeof(process_name)))
+                    {
+                        if (!is_connection_already_logged(pid6, v6key, dp, action6))
+                        {
+                            char dest_ip_str[64];
+                            const UINT8 *d6 = (const UINT8*)ipv6_header->DstAddr;
+                            inet_ntop(AF_INET6, d6, dest_ip_str, sizeof(dest_ip_str));
+
+                            char proxy_info[128];
+                            if (action6 == RULE_ACTION_PROXY)
+                            {
+                                PROXY_CONFIG *pcfg = find_proxy_config(proxy_config_id6);
+                                if (pcfg != NULL)
+                                    snprintf(proxy_info, sizeof(proxy_info), "Proxy %s://%s:%d",
+                                        pcfg->type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
+                                        pcfg->host, pcfg->port);
+                                else
+                                    snprintf(proxy_info, sizeof(proxy_info), "Proxy");
+                            }
+                            else if (action6 == RULE_ACTION_DIRECT)
+                                snprintf(proxy_info, sizeof(proxy_info), "Direct");
+                            else
+                                snprintf(proxy_info, sizeof(proxy_info), "Blocked");
+
+                            const char *display_name = extract_filename(process_name);
+                            g_connection_callback(display_name, pid6, dest_ip_str, dp, proxy_info);
+
+                            if (g_traffic_logging_enabled)
+                                add_logged_connection(pid6, v6key, dp, action6);
+                        }
+                    }
+                }
+
+                if (action6 == RULE_ACTION_DIRECT)
+                {
+                    port_set_direct(sp);
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+                else if (action6 == RULE_ACTION_BLOCK)
+                {
+                    port_set_decided(sp);
+                    continue;
+                }
+                else if (action6 == RULE_ACTION_PROXY)
+                {
+                    add_connection_v6(sp, (const UINT8*)ipv6_header->SrcAddr, (const UINT8*)ipv6_header->DstAddr, dp, proxy_config_id6);
+                    port_set_decided(sp);
+                    tcp_header->DstPort = htons(g_local_relay_port);
+
+                    static const UINT8 _lb6p[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+                    BOOL both_lb = (memcmp(ipv6_header->SrcAddr, _lb6p, 16) == 0 &&
+                                    memcmp(ipv6_header->DstAddr, _lb6p, 16) == 0);
+                    if (!both_lb)
+                    {
+                        UINT32 tmp[4];
+                        memcpy(tmp, ipv6_header->DstAddr, 16);
+                        memcpy(ipv6_header->DstAddr, ipv6_header->SrcAddr, 16);
+                        memcpy(ipv6_header->SrcAddr, tmp, 16);
+                        addr.Outbound = FALSE;
+                    }
+                    // loopback (::1→::1): just changed DstPort, keep Outbound=TRUE
+                    goto ipv6_send;
+                }
+            }
+            else
+            {
+                if (tcp_header->DstPort != htons(g_local_relay_port))
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+            }
+
+        ipv6_send:
+            WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
+            WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+            continue;
+        }
+
+        if (udp_header != NULL && tcp_header == NULL)
+        {
+            if (addr.Outbound)
+            {
+                if (udp_header->SrcPort == htons(LOCAL_UDP_RELAY_PORT))
+                {
+                    UINT16 dst_port = ntohs(udp_header->DstPort);
+                    UINT32 orig_dest_ip;
+                    UINT16 orig_dest_port;
+
+                    if (get_connection(dst_port, &orig_dest_ip, &orig_dest_port))
+                    {
+                        // Restore both source IP and port to original destination
+                        ip_header->SrcAddr = orig_dest_ip;
+                        udp_header->SrcPort = htons(orig_dest_port);
+
+                        // loopback need outbound injection inbound dont work on windows loopback
+                        // bcz fast path skip the recive layer we inject into
+                        // outbound makes loopback echo it back as inbound which actualy reach socket
+                        // impostor flag stops it getting recaptured again
+                        // for real nic inbound injection works fine no extra hop
+                        BYTE dst_first_octet = (ntohl(ip_header->DstAddr) >> 24) & 0xFF;
+                        if (dst_first_octet != 127)
+                            addr.Outbound = FALSE;
+                        // else: stay OUTBOUND - loopback echo delivers the packet
+                    }
+                    else
+                    {
+                        /* Connection entry gone expired or not added
+                         * relay port 34011 as source would be rejected by any connected
+                         * socket expecting the real server port.  Drop instead. */
+                        log_message("[UDP RELAY] No tracked connection for relay response to port %d dropping", dst_port);
+                        continue;
+                    }
+                }
+                else if (is_connection_tracked(ntohs(udp_header->SrcPort)))
+                {
+                    UINT16 src_port = ntohs(udp_header->SrcPort);
+                    udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+
+                    BYTE src_first_octet = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
+                    BOOL src_is_loopback = (src_first_octet == 127);
+                    if (src_is_loopback)
+                    {
+                        ip_header->DstAddr = htonl(INADDR_LOOPBACK);
+                    }
+                    else
+                    {
+                        UINT32 temp_addr = ip_header->DstAddr;
+                        ip_header->DstAddr = ip_header->SrcAddr;
+                        ip_header->SrcAddr = temp_addr;
+                        addr.Outbound = FALSE;
+                    }
+                }
+                else
+                {
+                    UINT16 src_port = ntohs(udp_header->SrcPort);
+                    UINT32 src_ip = ip_header->SrcAddr;
+                    UINT32 dest_ip = ip_header->DstAddr;
+                    UINT16 dest_port = ntohs(udp_header->DstPort);
+
+                    // if no rule configuree all connection direct with no checks avoid unwanted memory and pocessing whcich could delay
+                    if (!g_has_active_rules && g_connection_callback == NULL)
+                    {
+                        // No rules and no logging - pass through immediately (no checksum needed for unmodified packets)
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+
+                    RuleAction action;
+                    DWORD pid = 0;
+                    UINT32 proxy_config_id = 0;
+
+                    action = check_process_rule(src_ip, src_port, dest_ip, dest_port, TRUE, &pid, &proxy_config_id);
+
+                    // ── DNS interception (Extended ProxyBridge) ─────────────────────
+                    // Outbound query to port 53 from a process that has a DNS policy
+                    // configured on one of its PROXY rules: hand it off to a worker
+                    // thread (see dns_intercept_query) and drop the real query here -
+                    // never let it leave, and never fall through to the normal
+                    // proxy/direct handling below for this packet. Returns FALSE (and
+                    // does nothing) when the process has no DNS policy configured, so
+                    // this packet falls through to the normal handling untouched.
+                    if (dest_port == 53 && pid > 0)
+                    {
+                        const UINT8 *dns_payload = (const UINT8 *)udp_header + sizeof(WINDIVERT_UDPHDR);
+                        int dns_payload_len = (int)(ntohs(udp_header->Length) - sizeof(WINDIVERT_UDPHDR));
+                        if (dns_intercept_query(packet, packet_len, &addr, ip_header, udp_header,
+                                                 dns_payload, dns_payload_len, pid))
+                            continue; // real query dropped - worker thread answers (or the app times out)
+                    }
+
+                    // override PROXY to DIRECT if localhost proxy is disabled and destination is localhost
+                    BYTE dest_first_octet = (dest_ip >> 0) & 0xFF;
+                    if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy && dest_first_octet == 127)
+                        action = RULE_ACTION_DIRECT;
+
+                    // Override PROXY to DIRECT for critical IPs and ports
+                    if (action == RULE_ACTION_PROXY && is_broadcast_or_multicast(dest_ip))
+                        action = RULE_ACTION_DIRECT;
+
+                    // Override PROXY to DIRECT for DHCP ports (67=server, 68=client)
+                    if (action == RULE_ACTION_PROXY && (dest_port == 67 || dest_port == 68))
+                        action = RULE_ACTION_DIRECT;
+
+                    // only log if callback is set
+                    // reuse pid from check_process_rule
+                    // CLI use no log flag
+                    if (g_connection_callback != NULL && pid > 0)
+                    {
+                        char process_name[MAX_PROCESS_NAME];
+
+                        if (pid > 0 && get_process_name_from_pid(pid, process_name, sizeof(process_name)))
+                        {
+                            if (!is_connection_already_logged(pid, dest_ip, dest_port, action))
+                            {
+                                char dest_ip_str[32];
+                                format_ip_address(dest_ip, dest_ip_str, sizeof(dest_ip_str));
+
+                                char proxy_info[128];
+                                if (action == RULE_ACTION_PROXY)
+                                {
+                                    PROXY_CONFIG *pcfg = find_proxy_config(proxy_config_id);
+                                    if (pcfg != NULL)
+                                        snprintf(proxy_info, sizeof(proxy_info), "Proxy %s://%s:%d (UDP)",
+                                            pcfg->type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
+                                            pcfg->host, pcfg->port);
+                                    else
+                                        snprintf(proxy_info, sizeof(proxy_info), "Proxy (UDP)");
+                                }
+                                else if (action == RULE_ACTION_DIRECT)
+                                {
+                                    snprintf(proxy_info, sizeof(proxy_info), "Direct (UDP)");
+                                }
+                                else if (action == RULE_ACTION_BLOCK)
+                                {
+                                    snprintf(proxy_info, sizeof(proxy_info), "Blocked (UDP)");
+                                }
+
+                                const char* display_name = extract_filename(process_name);
+                                g_connection_callback(display_name, pid, dest_ip_str, dest_port, proxy_info);
+
+                                if (g_traffic_logging_enabled)
+                                {
+                                    add_logged_connection(pid, dest_ip, dest_port, action);
+                                }
+                            }
+                        }
+                    }
+
+                    if (action == RULE_ACTION_BLOCK)
+                    {
+                        continue;
+                    }
+
+                    if (action == RULE_ACTION_PROXY)
+                    {
+                        add_connection(src_port, src_ip, dest_ip, dest_port, proxy_config_id);
+
+                        // redirect to UDP relay server at 127.0.0.1:34011
+                        udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+
+                        // check if source is localhost
+                        BYTE src_first_octet = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
+                        BOOL src_is_loopback = (src_first_octet == 127);
+
+                        if (src_is_loopback)
+                        {
+                            ip_header->DstAddr = htonl(INADDR_LOOPBACK);
+                        }
+                        else
+                        {
+                            UINT32 temp_addr = ip_header->DstAddr;
+                            ip_header->DstAddr = ip_header->SrcAddr;
+                            ip_header->SrcAddr = temp_addr;
+                            addr.Outbound = FALSE;
+                        }
+                        // for loopback we need keep as outbound (127.x.x.x -> 127.0.0.1)
+                        // for a fucking stupid reason i missed this part for 6 months
+                    }
+                    else
+                    {
+                        // DIRECT (or no matching rule): the packet is unmodified, so send it
+                        // as-is. Recomputing checksums on an untouched packet is wasteful and
+                        // can conflict with NIC checksum offload on some drivers (see #161).
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                }
+            }
+            else
+            {
+                if (udp_header->DstPort != htons(LOCAL_UDP_RELAY_PORT))
+                {
+                    // Snoop DNS responses to build the IP→hostname cache used by
+                    // socks5_connect_domain() so that SOCKS5 proxies receive the
+                    // original hostname instead of a bare IP (issue #138).
+                    if (ntohs(udp_header->SrcPort) == 53)
+                    {
+                        const UINT8 *udp_payload = (const UINT8 *)udp_header + sizeof(WINDIVERT_UDPHDR);
+                        int udp_payload_len = (int)(ntohs(udp_header->Length) - sizeof(WINDIVERT_UDPHDR));
+                        if (udp_payload_len > 0)
+                            snoop_dns_response(udp_payload, udp_payload_len);
+                    }
+                    // Unmodified packet no checksum needed
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+
+            }
+
+            // Modified UDP packet calculate checksums
+            WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
+            WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+            continue;
+        }        // TCP packets only from here
+        if (tcp_header == NULL)
+            continue;
+
+        if (addr.Outbound)
+        {
+            // per port decision fast-path.
+            // Once check_process_rule() has run for a source port and decided DIRECT,
+            // every subsequent packet from that port takes this branch one bitmap
+            // read 5 cycle + WinDivertSend, with zero kernel calls
+            // FIN/RST clears the cache entry so port can be reused safely
+            // Part of this taken from Cluade to fix windivert packet error
+            {
+                UINT16 sp = ntohs(tcp_header->SrcPort);
+
+                // A fresh SYN starts a new connection that may be reusing an ephemeral
+                // port whose previous owner has closed. Evict any PID cached for this
+                // port so the rule decision is re-derived against the correct current
+                // process instead of a stale one (prevents wrong-app rule matching for
+                // up to PID_CACHE_TTL_MS after a port is recycled).
+                if (tcp_header->Syn && !tcp_header->Ack)
+                    remove_cached_pid(ip_header->SrcAddr, sp, FALSE);
+
+                if (port_is_decided(sp))
+                {
+                    if (tcp_header->Fin || tcp_header->Rst)
+                        port_clear(sp);
+                    if (port_is_direct(sp))
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                    // For PROXY/BLOCK decisions the connection was already added on the
+                    // first packet; subsequent packets are handled by is_connection_tracked
+                    // below so just fall through.
+                }
+            }
+
+            if (tcp_header->SrcPort == htons(g_local_relay_port))
+            {
+                UINT16 dst_port = ntohs(tcp_header->DstPort);
+                UINT32 orig_dest_ip;
+                UINT16 orig_dest_port;
+
+                if (get_connection(dst_port, &orig_dest_ip, &orig_dest_port))
+                    tcp_header->SrcPort = htons(orig_dest_port);
+
+                BYTE src_first = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
+                BYTE dst_first = (ntohl(ip_header->DstAddr) >> 24) & 0xFF;
+                BOOL is_loopback = (src_first == 127 && dst_first == 127);
+
+                if (!is_loopback)
+                {
+                    UINT32 temp_addr = ip_header->DstAddr;
+                    ip_header->DstAddr = ip_header->SrcAddr;
+                    ip_header->SrcAddr = temp_addr;
+                    addr.Outbound = FALSE;
+                }
+
+
+                if (tcp_header->Fin || tcp_header->Rst)
+                    remove_connection(dst_port);
+            }
+            else if (is_connection_tracked(ntohs(tcp_header->SrcPort)))
+            {
+                UINT16 src_port = ntohs(tcp_header->SrcPort);
+
+                if (tcp_header->Fin || tcp_header->Rst)
+                {
+                    remove_connection(src_port);
+                    port_clear(src_port);
+                }
+
+                tcp_header->DstPort = htons(g_local_relay_port);
+
+                BYTE src_first = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
+                BYTE dst_first = (ntohl(ip_header->DstAddr) >> 24) & 0xFF;
+                BOOL is_loopback = (src_first == 127 && dst_first == 127);
+
+                if (!is_loopback)
+                {
+                    UINT32 temp_addr = ip_header->DstAddr;
+                    ip_header->DstAddr = ip_header->SrcAddr;
+                    ip_header->SrcAddr = temp_addr;
+                    addr.Outbound = FALSE;
+                }
+
+            }
+            else
+            {
+                UINT16 src_port = ntohs(tcp_header->SrcPort);
+                UINT32 src_ip = ip_header->SrcAddr;
+                UINT32 orig_dest_ip = ip_header->DstAddr;
+                UINT16 orig_dest_port = ntohs(tcp_header->DstPort);
+
+                // avoid rule pocess and packet process if no rules
+                if (!g_has_active_rules && g_connection_callback == NULL)
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+
+                RuleAction action;
+                DWORD pid = 0;
+                UINT32 proxy_config_id = 0;
+
+                action = check_process_rule(src_ip, src_port, orig_dest_ip, orig_dest_port, FALSE, &pid, &proxy_config_id);
+
+                BYTE orig_dest_first_octet = (orig_dest_ip >> 0) & 0xFF;
+                if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy && orig_dest_first_octet == 127)
+                    action = RULE_ACTION_DIRECT;
+
+                // Override PROXY to DIRECT for criticl ips
+                if (action == RULE_ACTION_PROXY && is_broadcast_or_multicast(orig_dest_ip))
+                    action = RULE_ACTION_DIRECT;
+
+                // only new TCP/SYN inital fist packet
+                if (g_connection_callback != NULL && tcp_header->Syn && !tcp_header->Ack && pid > 0)
+                {
+                    char process_name[MAX_PROCESS_NAME];
+                    if (pid > 0 && get_process_name_from_pid(pid, process_name, sizeof(process_name)))
+                    {
+                        if (!is_connection_already_logged(pid, orig_dest_ip, orig_dest_port, action))
+                        {
+                            char dest_ip_str[32];
+                            snprintf(dest_ip_str, sizeof(dest_ip_str), "%d.%d.%d.%d",
+                                (orig_dest_ip >> 0) & 0xFF, (orig_dest_ip >> 8) & 0xFF,
+                                (orig_dest_ip >> 16) & 0xFF, (orig_dest_ip >> 24) & 0xFF);
+
+                            char proxy_info[128];
+                            if (action == RULE_ACTION_PROXY)
+                            {
+                                PROXY_CONFIG *pcfg = find_proxy_config(proxy_config_id);
+                                if (pcfg != NULL)
+                                    snprintf(proxy_info, sizeof(proxy_info), "Proxy %s://%s:%d",
+                                        pcfg->type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
+                                        pcfg->host, pcfg->port);
+                                else
+                                    snprintf(proxy_info, sizeof(proxy_info), "Proxy");
+                            }
+                            else if (action == RULE_ACTION_DIRECT)
+                            {
+                                snprintf(proxy_info, sizeof(proxy_info), "Direct");
+                            }
+                            else if (action == RULE_ACTION_BLOCK)
+                            {
+                                snprintf(proxy_info, sizeof(proxy_info), "Blocked");
+                            }
+
+                            const char* display_name = extract_filename(process_name);
+                            g_connection_callback(display_name, pid, dest_ip_str, orig_dest_port, proxy_info);
+
+                            if (g_traffic_logging_enabled)
+                            {
+                                add_logged_connection(pid, orig_dest_ip, orig_dest_port, action);
+                            }
+                        }
+                    }
+                }
+
+                if (action == RULE_ACTION_DIRECT)
+                {
+                    // Cache this decision so all subsequent packets from this port
+                    // fast-path at the top of the outbound branch (zero kernel calls).
+                    port_set_direct(src_port);
+                    // Unmodified packet no checksum needed
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+                else if (action == RULE_ACTION_BLOCK)
+                {
+                    port_set_decided(src_port);  // mark decided (not direct) so we don't re-run rule check
+                    // Drop the packet - don't send it anywhere
+                    continue;
+                }
+                else if (action == RULE_ACTION_PROXY)
+            {
+                add_connection(src_port, src_ip, orig_dest_ip, orig_dest_port, proxy_config_id);
+                // Mark this port as decided (not direct) so subsequent packets from
+                // the same source port skip the rule check.  The is_connection_tracked
+                // branch above handles the actual per-packet redirect.
+                port_set_decided(src_port);
+
+                tcp_header->DstPort = htons(g_local_relay_port);
+
+                // check if this is localhost -> localhost traffic
+                BYTE src_first_octet = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
+                BYTE dst_first_octet = (ntohl(ip_header->DstAddr) >> 24) & 0xFF;
+                BOOL is_loopback_to_loopback = (src_first_octet == 127 && dst_first_octet == 127);
+
+                if (is_loopback_to_loopback)
+                {
+                    // for localhost -> localhost just change port, keep as outbound
+                    // dont swap IPs Windows loopback routing needs both to stay 127.x.x.x
+                    log_message("[PACKET] Loopback redirect: 127.x.x.x:%d -> 127.x.x.x:%d (relay port %d)",
+                        ntohs(tcp_header->SrcPort), orig_dest_port, g_local_relay_port);
+                    // addr.Outbound stays TRUE
+                }
+                else
+                {
+                    // for normal traffic: swap IPs and mark as inbound (standard relay behavior)
+                    UINT32 temp_addr = ip_header->DstAddr;
+                    ip_header->DstAddr = ip_header->SrcAddr;
+                    ip_header->SrcAddr = temp_addr;
+                    addr.Outbound = FALSE;
+                }
+                }
+            }
+        }
+        else
+        {
+            if (tcp_header->DstPort != htons(g_local_relay_port))
+            {
+                // Unmodified return packet no checksum needed
+                WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                continue;
+            }
+        }
+
+        // Modified TCP packet calculate checksums
+        WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
+        if (!WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr))
+        {
+            log_message("Failed to send packet (%lu)", GetLastError());
+        }
+    }
+
+    return 0;
+}
+
+static UINT32 parse_ipv4(const char *ip)
+{
+    unsigned int a, b, c, d;
+    if (sscanf_s(ip, "%u.%u.%u.%u", &a, &b, &c, &d) != 4)
+        return 0;
+    if (a > 255 || b > 255 || c > 255 || d > 255)
+        return 0;
+    return (a << 0) | (b << 8) | (c << 16) | (d << 24);
+}
+
+// Resolve hostname to IPv4 address (supports both IP addresses and domain names)
+static UINT32 resolve_hostname(const char *hostname)
+{
+    if (hostname == NULL || hostname[0] == '\0')
+        return 0;
+
+    // First try to parse as IP address
+    UINT32 ip = parse_ipv4(hostname);
+    if (ip != 0)
+        return ip;
+
+    // Not an IP address, try DNS resolution
+    struct addrinfo hints, *result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;  // IPv4 only
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(hostname, NULL, &hints, &result) != 0)
+    {
+        log_message("Failed to resolve hostname: %s", hostname);
+        return 0;
+    }
+
+    if (result == NULL || result->ai_family != AF_INET)
+    {
+        if (result != NULL)
+            freeaddrinfo(result);
+        log_message("No IPv4 address found for hostname: %s", hostname);
+        return 0;
+    }
+
+    struct sockaddr_in *addr = (struct sockaddr_in *)result->ai_addr;
+    UINT32 resolved_ip = addr->sin_addr.s_addr;
+    freeaddrinfo(result);
+
+    log_message("Resolved %s to %d.%d.%d.%d", hostname,
+        (resolved_ip >> 0) & 0xFF, (resolved_ip >> 8) & 0xFF,
+        (resolved_ip >> 16) & 0xFF, (resolved_ip >> 24) & 0xFF);
+
+    return resolved_ip;
+}
+
+// ── DNS resolution policy (Extended ProxyBridge) ────────────────────────────
+
+// Hands out the next address from the 198.18.0.0/15 fake-IP range and
+// registers it in the DNS snoop cache under `hostname`, so the existing
+// domain-aware connect path (dns_cache_lookup + socks5_connect_domain) picks
+// it up with no further changes. See the big comment above FAKE_IP_COUNT.
+static UINT32 fake_ip_alloc(const char *hostname)
+{
+    if (hostname == NULL || hostname[0] == '\0')
+        return 0;
+
+    UINT32 idx = ((UINT32)InterlockedIncrement(&g_fake_ip_counter) - 1) & (FAKE_IP_COUNT - 1);
+
+    UINT32 a = 198;
+    UINT32 b = 18 + ((idx >> 16) & 0x1);  // 18 or 19 - together with 'a' this is the /15
+    UINT32 c = (idx >> 8) & 0xFF;
+    UINT32 d = idx & 0xFF;
+
+    // Same in-memory byte layout as parse_ipv4()/sin_addr.s_addr elsewhere in
+    // this file: first octet in bits 0-7, last octet in bits 24-31.
+    UINT32 fake_ip = (a << 0) | (b << 8) | (c << 16) | (d << 24);
+
+    dns_cache_store(fake_ip, hostname);
+    return fake_ip;
+}
+
+// True if ip falls inside the 198.18.0.0/15 fake-IP range.
+static BOOL is_fake_ip(UINT32 ip)
+{
+    UINT32 a = ip & 0xFF;
+    UINT32 b = (ip >> 8) & 0xFF;
+    return (a == 198 && (b == 18 || b == 19));
+}
+
+// Minimal hand-rolled DNS client: sends a single A-record query to each
+// configured custom server in order (see ProxyBridge_SetCustomDnsServers)
+// until one answers, and returns the first A record in the response. Needed
+// because Windows gives no supported way to point getaddrinfo() at a specific
+// server - resolve_hostname() above always uses whatever DNS Windows itself
+// is configured with.
+static UINT32 resolve_via_custom_dns(const char *hostname, int timeout_ms)
+{
+    if (hostname == NULL || hostname[0] == '\0' || g_custom_dns_server_count == 0)
+        return 0;
+
+    // Defensive: unlike most of this file's networking, this function may be
+    // called standalone (e.g. via ProxyBridge_ResolveViaCustomDns) before
+    // ProxyBridge_Start() has ever run and brought Winsock up as a side
+    // effect. WSAStartup is safe to call more than once (refcounted).
+    {
+        WSADATA wsa_probe;
+        WSAStartup(MAKEWORD(2, 2), &wsa_probe);
+    }
+
+    // Build the query once, reuse for every server we try.
+    UINT8 query[512];
+    int qlen = 0;
+
+    // Header: random-ish transaction ID, standard recursive query, 1 question.
+    UINT16 txid = (UINT16)(GetTickCount64() & 0xFFFF);
+    query[qlen++] = (UINT8)(txid >> 8);
+    query[qlen++] = (UINT8)(txid & 0xFF);
+    query[qlen++] = 0x01; query[qlen++] = 0x00; // flags: standard query, recursion desired
+    query[qlen++] = 0x00; query[qlen++] = 0x01; // QDCOUNT = 1
+    query[qlen++] = 0x00; query[qlen++] = 0x00; // ANCOUNT = 0
+    query[qlen++] = 0x00; query[qlen++] = 0x00; // NSCOUNT = 0
+    query[qlen++] = 0x00; query[qlen++] = 0x00; // ARCOUNT = 0
+
+    // QNAME: length-prefixed labels, e.g. "example.com" -> \x07example\x03com\x00
+    const char *p = hostname;
+    while (*p && qlen < (int)sizeof(query) - 16)
+    {
+        const char *dot = strchr(p, '.');
+        size_t label_len = dot ? (size_t)(dot - p) : strlen(p);
+        if (label_len == 0 || label_len > 63) return 0; // malformed hostname
+        query[qlen++] = (UINT8)label_len;
+        memcpy(&query[qlen], p, label_len);
+        qlen += (int)label_len;
+        p += label_len;
+        if (dot) p++; // skip the dot
+        else break;
+    }
+    query[qlen++] = 0x00;              // terminating root label
+    query[qlen++] = 0x00; query[qlen++] = 0x01; // QTYPE  = A
+    query[qlen++] = 0x00; query[qlen++] = 0x01; // QCLASS = IN
+
+    for (int srv = 0; srv < g_custom_dns_server_count; srv++)
+    {
+        SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock == INVALID_SOCKET)
+            continue;
+
+        DWORD tv = (DWORD)timeout_ms;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+        struct sockaddr_in dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        dst.sin_port   = htons(g_custom_dns_servers[srv].port);
+        dst.sin_addr.s_addr = g_custom_dns_servers[srv].ip;
+
+        if (sendto(sock, (const char*)query, qlen, 0, (struct sockaddr*)&dst, sizeof(dst)) == SOCKET_ERROR)
+        {
+            closesocket(sock);
+            continue;
+        }
+
+        UINT8 resp[512];
+        int rlen = recvfrom(sock, (char*)resp, sizeof(resp), 0, NULL, NULL);
+        closesocket(sock);
+
+        if (rlen < 12) continue; // shorter than a DNS header - not a real reply
+
+        // Match transaction ID and check RCODE (low nibble of byte 3) == 0 (no error).
+        UINT16 resp_txid = ((UINT16)resp[0] << 8) | resp[1];
+        if (resp_txid != txid) continue;
+        if ((resp[3] & 0x0F) != 0) continue; // server returned an error (NXDOMAIN etc.)
+
+        int ancount = ((int)resp[6] << 8) | resp[7];
+        if (ancount <= 0) continue;
+
+        // Skip the question section we sent (same qname length we built above).
+        int pos = 12;
+        while (pos < rlen && resp[pos] != 0)
+        {
+            if ((resp[pos] & 0xC0) == 0xC0) { pos += 2; goto question_done; } // compressed (shouldn't happen here, but be safe)
+            pos += resp[pos] + 1;
+        }
+        pos += 1; // the terminating zero label
+    question_done:
+        pos += 4; // QTYPE + QCLASS
+
+        // Walk the answer records looking for the first A record.
+        for (int i = 0; i < ancount && pos + 12 <= rlen; i++)
+        {
+            // NAME: either a pointer (0xC0 xx, 2 bytes) or inline labels - skip either way.
+            if ((resp[pos] & 0xC0) == 0xC0)
+                pos += 2;
+            else
+            {
+                while (pos < rlen && resp[pos] != 0) pos += resp[pos] + 1;
+                pos += 1;
+            }
+            if (pos + 10 > rlen) break;
+
+            UINT16 rtype  = ((UINT16)resp[pos] << 8) | resp[pos+1];
+            UINT16 rclass = ((UINT16)resp[pos+2] << 8) | resp[pos+3];
+            UINT16 rdlen  = ((UINT16)resp[pos+8] << 8) | resp[pos+9];
+            pos += 10;
+
+            if (rtype == 1 && rclass == 1 && rdlen == 4 && pos + 4 <= rlen) // A record, IN class
+            {
+                UINT32 ip = ((UINT32)resp[pos] << 0) | ((UINT32)resp[pos+1] << 8) |
+                            ((UINT32)resp[pos+2] << 16) | ((UINT32)resp[pos+3] << 24);
+                log_message("Custom DNS: resolved %s via %d.%d.%d.%d",
+                    hostname,
+                    g_custom_dns_servers[srv].ip & 0xFF, (g_custom_dns_servers[srv].ip >> 8) & 0xFF,
+                    (g_custom_dns_servers[srv].ip >> 16) & 0xFF, (g_custom_dns_servers[srv].ip >> 24) & 0xFF);
+                return ip;
+            }
+            pos += rdlen;
+        }
+        // This server answered but had no usable A record - try the next one.
+    }
+
+    return 0; // every configured custom server failed or had no answer
+}
+
+// Finds the DNS resolution policy that applies to a process, for the purpose
+// of deciding whether to intercept its outbound DNS queries at all.
+//
+// Simplification (documented, not a bug): this matches ONLY on ProcessName,
+// walking rules_list in order and returning the first ENABLED, PROXY-action
+// rule whose process pattern matches - it does NOT also evaluate that rule's
+// TargetHosts/TargetPorts/TargetDomains, because at DNS-query time we don't
+// know the final destination yet (that's the whole point of the domain
+// query). If a process has several PROXY rules for different destinations,
+// the FIRST one in list order decides its DNS policy, same "first match
+// wins" spirit as the rest of this file. A rule with dns_resolution_count==0
+// (the default - never configured) means "don't intercept", so the search
+// simply moves on to the next rule for that process rather than stopping.
+static BOOL get_dns_policy_for_process(const char *process_name, UINT8 *out_sources, UINT8 *out_count)
+{
+    if (process_name == NULL || out_sources == NULL || out_count == NULL)
+        return FALSE;
+
+    *out_count = 0;
+
+    AcquireSRWLockShared(&g_rules_lock);
+    for (PROCESS_RULE *rule = rules_list; rule != NULL; rule = rule->next)
+    {
+        if (!rule->enabled || rule->action != RULE_ACTION_PROXY)
+            continue;
+        if (rule->dns_resolution_count == 0)
+            continue; // this rule has no DNS policy configured - keep looking
+        if (!match_process_pattern(rule->process_name, process_name))
+            continue;
+
+        memcpy(out_sources, rule->dns_resolution, rule->dns_resolution_count);
+        *out_count = rule->dns_resolution_count;
+        ReleaseSRWLockShared(&g_rules_lock);
+        return TRUE;
+    }
+    ReleaseSRWLockShared(&g_rules_lock);
+    return FALSE;
+}
+
+// ── DNS query interception worker (Extended ProxyBridge) ───────────────────
+// Handles one intercepted outbound DNS query end to end, off the single
+// packet-processing thread: tries each source in the process's DNS policy in
+// order, and on the first success, synthesizes and injects a spoofed
+// response. Network I/O (custom/system resolution) happens here, never on
+// the packet thread - see the big comment where this is invoked from.
+typedef struct {
+    UINT8  query[512];
+    int    query_len;
+    UINT32 client_ip;     // who asked (network byte order, same convention as ip_header->SrcAddr)
+    UINT16 client_port;
+    UINT32 dns_server_ip; // who they asked (becomes the spoofed response's source)
+    UINT16 dns_server_port;
+    BOOL   was_loopback;  // client_ip was 127.x.x.x - mirrors the loopback special-casing used elsewhere in this file
+    UINT8  sources[3];
+    UINT8  source_count;
+} DNS_INTERCEPT_CTX;
+
+static DWORD WINAPI dns_resolve_worker(LPVOID arg)
+{
+    DNS_INTERCEPT_CTX *ctx = (DNS_INTERCEPT_CTX *)arg;
+
+    // Extract the queried domain once; every source below needs it.
+    int name_offset = 12;
+    char domain[256];
+    if (!dns_parse_name(ctx->query, ctx->query_len, &name_offset, domain, sizeof(domain)))
+    {
+        free(ctx);
+        return 0; // malformed query - nothing sane to answer, just drop it (already dropped upstream)
+    }
+
+    UINT32 answer_ip = 0;
+    for (int i = 0; i < ctx->source_count && answer_ip == 0; i++)
+    {
+        switch (ctx->sources[i])
+        {
+            case DNS_SRC_PROXY:
+                answer_ip = fake_ip_alloc(domain);
+                break;
+            case DNS_SRC_CUSTOM:
+                answer_ip = resolve_via_custom_dns(domain, 1500);
+                break;
+            case DNS_SRC_SYSTEM:
+            default:
+                answer_ip = resolve_hostname(domain);
+                break;
+        }
+    }
+
+    if (answer_ip == 0)
+    {
+        // Every configured source failed. We already dropped the real query,
+        // so the application just sees this lookup time out and can retry -
+        // matches how a real, fully-unreachable DNS server would behave from
+        // its point of view. Logged so it's diagnosable instead of silent.
+        log_message("DNS intercept: all configured sources failed to resolve '%s' - query dropped, app will see a timeout", domain);
+        free(ctx);
+        return 0;
+    }
+
+    // Build the spoofed response: real IP/UDP/DNS headers, reusing the
+    // original question section byte-for-byte (transaction ID included, so
+    // the application's own matching logic accepts it as a real reply).
+    UINT8 packet[sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR) + 512 + 16];
+    memset(packet, 0, sizeof(packet));
+
+    PWINDIVERT_IPHDR  resp_ip  = (PWINDIVERT_IPHDR)packet;
+    PWINDIVERT_UDPHDR resp_udp = (PWINDIVERT_UDPHDR)(packet + sizeof(WINDIVERT_IPHDR));
+    UINT8 *dns_out = packet + sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR);
+
+    // DNS header: same transaction ID, standard response with 1 answer.
+    memcpy(dns_out, ctx->query, 2);              // transaction ID, copied verbatim
+    dns_out[2] = 0x81; dns_out[3] = 0x80;         // standard query response, recursion available, no error
+    dns_out[4] = 0x00; dns_out[5] = 0x01;         // QDCOUNT = 1
+    dns_out[6] = 0x00; dns_out[7] = 0x01;         // ANCOUNT = 1
+    dns_out[8] = 0x00; dns_out[9] = 0x00;         // NSCOUNT = 0
+    dns_out[10] = 0x00; dns_out[11] = 0x00;       // ARCOUNT = 0
+
+    int qsection_len = name_offset + 4 - 12;      // question section length (name + QTYPE + QCLASS)
+    memcpy(dns_out + 12, ctx->query + 12, qsection_len);
+    int pos = 12 + qsection_len;
+
+    // Answer RR: pointer back to the question's name, A record, our resolved/fake IP.
+    dns_out[pos++] = 0xC0; dns_out[pos++] = 0x0C; // name = pointer to offset 12
+    dns_out[pos++] = 0x00; dns_out[pos++] = 0x01; // TYPE = A
+    dns_out[pos++] = 0x00; dns_out[pos++] = 0x01; // CLASS = IN
+    dns_out[pos++] = 0x00; dns_out[pos++] = 0x00; dns_out[pos++] = 0x00; dns_out[pos++] = 0x3C; // TTL = 60s
+    dns_out[pos++] = 0x00; dns_out[pos++] = 0x04; // RDLENGTH = 4
+    memcpy(dns_out + pos, &answer_ip, 4);
+    pos += 4;
+
+    int dns_len = pos;
+    int udp_len = sizeof(WINDIVERT_UDPHDR) + dns_len;
+    int ip_len  = sizeof(WINDIVERT_IPHDR) + udp_len;
+
+    resp_ip->Version  = 4;
+    resp_ip->HdrLength = sizeof(WINDIVERT_IPHDR) / 4;
+    resp_ip->Length   = htons((UINT16)ip_len);
+    resp_ip->TTL      = 64;
+    resp_ip->Protocol = IPPROTO_UDP;
+    resp_ip->SrcAddr  = ctx->dns_server_ip;  // spoofed: "from" the DNS server the app actually queried
+    resp_ip->DstAddr  = ctx->client_ip;
+
+    resp_udp->SrcPort = htons(ctx->dns_server_port);
+    resp_udp->DstPort = htons(ctx->client_port);
+    resp_udp->Length  = htons((UINT16)udp_len);
+
+    WINDIVERT_ADDRESS addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.Layer = WINDIVERT_LAYER_NETWORK;
+    // Same loopback exception used everywhere else in this file: for 127.x.x.x
+    // traffic, injecting OUTBOUND (not inbound) is what actually gets delivered
+    // by the Windows loopback adapter; for real interfaces, INBOUND is correct.
+    addr.Outbound = ctx->was_loopback ? TRUE : FALSE;
+    addr.IPChecksum = 0;
+
+    WinDivertHelperCalcChecksums(packet, (UINT)ip_len, &addr, 0);
+
+    if (windivert_handle != INVALID_HANDLE_VALUE)
+    {
+        if (!WinDivertSend(windivert_handle, packet, (UINT)ip_len, NULL, &addr))
+            log_message("DNS intercept: failed to inject spoofed response for '%s' (%lu)", domain, GetLastError());
+    }
+
+    free(ctx);
+    return 0;
+}
+
+// Entry point called from packet_processor for every outbound, untracked UDP
+// packet whose destination port is 53, when the source process has a DNS
+// policy configured (get_dns_policy_for_process returned TRUE). Always drops
+// the real query - the caller must `continue` without ever calling
+// WinDivertSend on the original packet once this returns.
+static BOOL dns_intercept_query(const unsigned char *packet, UINT packet_len, WINDIVERT_ADDRESS *addr,
+                                 PWINDIVERT_IPHDR ip_header, PWINDIVERT_UDPHDR udp_header,
+                                 const UINT8 *dns_payload, int dns_payload_len, DWORD pid)
+{
+    (void)packet; (void)packet_len; (void)addr;
+
+    if (dns_payload_len < 12 || dns_payload_len > 512)
+        return FALSE; // not a sane single-question query - let it through untouched
+
+    char process_name[MAX_PROCESS_NAME];
+    if (!get_process_name_from_pid(pid, process_name, sizeof(process_name)))
+        return FALSE;
+
+    UINT8 sources[3];
+    UINT8 source_count = 0;
+    if (!get_dns_policy_for_process(process_name, sources, &source_count))
+        return FALSE; // no policy for this process - let it through untouched, exactly today's behaviour
+
+    DNS_INTERCEPT_CTX *ctx = (DNS_INTERCEPT_CTX *)malloc(sizeof(DNS_INTERCEPT_CTX));
+    if (ctx == NULL)
+        return FALSE; // couldn't allocate - fail open (let the real query through) rather than silently eating it
+
+    memcpy(ctx->query, dns_payload, dns_payload_len);
+    ctx->query_len        = dns_payload_len;
+    ctx->client_ip         = ip_header->SrcAddr;
+    ctx->client_port       = ntohs(udp_header->SrcPort);
+    ctx->dns_server_ip     = ip_header->DstAddr;
+    ctx->dns_server_port   = ntohs(udp_header->DstPort);
+    ctx->was_loopback      = (((ntohl(ip_header->SrcAddr) >> 24) & 0xFF) == 127);
+    memcpy(ctx->sources, sources, source_count);
+    ctx->source_count = source_count;
+
+    HANDLE t = CreateThread(NULL, 0, dns_resolve_worker, (LPVOID)ctx, 0, NULL);
+    if (t == NULL)
+    {
+        free(ctx);
+        return FALSE; // fail open here too
+    }
+    CloseHandle(t); // detached - the worker frees its own context and exits on its own
+    return TRUE;
+}
+
+// Reusable grow-only scratch buffer for the TCP/UDP owner-PID tables. These lookups run
+// only on the single packet-processor thread (NUM_PACKET_THREADS == 1) and each call
+// finishes scanning before the next one, so one shared buffer is safe and lets us skip a
+// malloc/free of the (potentially tens-of-KB) table on every new connection. Freed in Stop.
+static char  *g_pidtbl_buf = NULL;
+static DWORD  g_pidtbl_cap = 0;
+
+static void *pidtbl_reserve(DWORD need)
+{
+    if (need > g_pidtbl_cap)
+    {
+        DWORD newcap = g_pidtbl_cap ? g_pidtbl_cap : 16384;
+        while (newcap < need)
+        {
+            if (newcap > (0xFFFFFFFFu / 2)) { newcap = need; break; }
+            newcap *= 2;
+        }
+        char *nb = (char *)realloc(g_pidtbl_buf, newcap);
+        if (nb == NULL) return NULL;   // keep the old buffer intact on failure
+        g_pidtbl_buf = nb;
+        g_pidtbl_cap = newcap;
+    }
+    return g_pidtbl_buf;
+}
+
+static DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port)
+{
+    // check cache first
+    DWORD cached_pid = get_cached_pid(src_ip, src_port, FALSE);
+    if (cached_pid != 0)
+        return cached_pid;
+
+    DWORD size = 0;
+    DWORD pid = 0;
+
+    if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET,
+                            TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER)
+    {
+        return 0;
+    }
+
+    MIB_TCPTABLE_OWNER_PID *tcp_table = (MIB_TCPTABLE_OWNER_PID *)pidtbl_reserve(size);
+    if (tcp_table == NULL)
+    {
+        return 0;
+    }
+
+    if (GetExtendedTcpTable(tcp_table, &size, FALSE, AF_INET,
+                            TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR)
+    {
+        return 0;   // buffer is reused, not freed
+    }
+
+    for (DWORD i = 0; i < tcp_table->dwNumEntries; i++)
+    {
+        MIB_TCPROW_OWNER_PID *row = &tcp_table->table[i];
+
+        if (row->dwLocalAddr == src_ip &&
+            ntohs((UINT16)row->dwLocalPort) == src_port)
+        {
+            pid = row->dwOwningPid;
+            break;
+        }
+    }
+
+    // store cache the result
+    if (pid != 0)
+        cache_pid(src_ip, src_port, pid, FALSE);
+
+    return pid;
+}
+
+// Get process ID for UDP connection
+static DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port)
+{
+    DWORD cached_pid = get_cached_pid(src_ip, src_port, TRUE);
+    if (cached_pid != 0)
+        return cached_pid;
+
+    DWORD size = 0;
+    DWORD pid = 0;
+
+    if (GetExtendedUdpTable(NULL, &size, FALSE, AF_INET,
+                            UDP_TABLE_OWNER_PID, 0) != ERROR_INSUFFICIENT_BUFFER)
+    {
+        return 0;
+    }
+
+    MIB_UDPTABLE_OWNER_PID *udp_table = (MIB_UDPTABLE_OWNER_PID *)pidtbl_reserve(size);
+    if (udp_table == NULL)
+    {
+        return 0;
+    }
+
+    if (GetExtendedUdpTable(udp_table, &size, FALSE, AF_INET,
+                            UDP_TABLE_OWNER_PID, 0) != NO_ERROR)
+    {
+        return 0;   // buffer is reused, not freed
+    }
+
+    // First pass: Try exact match (IP + port)
+    for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
+    {
+        MIB_UDPROW_OWNER_PID *row = &udp_table->table[i];
+
+        if (row->dwLocalAddr == src_ip &&
+            ntohs((UINT16)row->dwLocalPort) == src_port)
+        {
+            pid = row->dwOwningPid;
+            break;
+        }
+    }
+
+    // Second pass: If not found, try matching port on 0.0.0.0 (INADDR_ANY)
+    // Many UDP applications bind to 0.0.0.0:port instead of specific IP
+    if (pid == 0)
+    {
+        for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
+        {
+            MIB_UDPROW_OWNER_PID *row = &udp_table->table[i];
+
+            if (row->dwLocalAddr == 0 &&  // 0.0.0.0 (INADDR_ANY)
+                ntohs((UINT16)row->dwLocalPort) == src_port)
+            {
+                pid = row->dwOwningPid;
+                break;
+            }
+        }
+    }
+
+    if (pid != 0)
+        cache_pid(src_ip, src_port, pid, TRUE);
+
+    return pid;
+}
+
+static DWORD get_process_id_from_connection_v6(const UINT8 src_ip6[16], UINT16 src_port)
+{
+    DWORD size = 0, pid = 0;
+
+    if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER)
+        return 0;
+    MIB_TCP6TABLE_OWNER_PID *tcp_table = (MIB_TCP6TABLE_OWNER_PID *)pidtbl_reserve(size);
+    if (!tcp_table) return 0;
+    if (GetExtendedTcpTable(tcp_table, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR)
+    {
+        for (DWORD i = 0; i < tcp_table->dwNumEntries; i++)
+        {
+            MIB_TCP6ROW_OWNER_PID *row = &tcp_table->table[i];
+            if (ntohs((UINT16)row->dwLocalPort) == src_port &&
+                memcmp(row->ucLocalAddr, src_ip6, 16) == 0)
+            {
+                pid = row->dwOwningPid;
+                break;
+            }
+        }
+    }
+    return pid;   // buffer is reused, not freed
+}
+
+static DWORD get_process_id_from_udp_connection_v6(const UINT8 src_ip6[16], UINT16 src_port)
+{
+    DWORD size = 0, pid = 0;
+
+    if (GetExtendedUdpTable(NULL, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) != ERROR_INSUFFICIENT_BUFFER)
+        return 0;
+    MIB_UDP6TABLE_OWNER_PID *udp_table = (MIB_UDP6TABLE_OWNER_PID *)pidtbl_reserve(size);
+    if (!udp_table) return 0;
+    if (GetExtendedUdpTable(udp_table, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) == NO_ERROR)
+    {
+        for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
+        {
+            MIB_UDP6ROW_OWNER_PID *row = &udp_table->table[i];
+            if (ntohs((UINT16)row->dwLocalPort) == src_port &&
+                (memcmp(row->ucLocalAddr, src_ip6, 16) == 0 ||
+                 memcmp(row->ucLocalAddr, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0))
+            {
+                pid = row->dwOwningPid;
+                break;
+            }
+        }
+    }
+    return pid;   // buffer is reused, not freed
+}
+
+static BOOL is_ipv6_multicast_or_linklocal(const UINT8 ip6[16])
+{
+    // Multicast: FF00::/8  (IPv6 has no broadcast; multicast replaces it)
+    if (ip6[0] == 0xFF) return TRUE;
+    // Link-local: FE80::/10  (equivalent to IPv4 APIPA 169.254.0.0/16)
+    if (ip6[0] == 0xFE && (ip6[1] & 0xC0) == 0x80) return TRUE;
+    // Site-local (deprecated RFC 3879): FEC0::/10 - still seen on old equipment
+    if (ip6[0] == 0xFE && (ip6[1] & 0xC0) == 0xC0) return TRUE;
+    // Unspecified address: :: (all-zeros) - equivalent to IPv4 0.0.0.0
+    {
+        static const UINT8 unspec[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        if (memcmp(ip6, unspec, 16) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+static RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const UINT8 dest_ip6[16], UINT16 dest_port, BOOL is_udp, DWORD *out_pid, UINT32 *out_proxy_config_id)
+{
+    DWORD pid;
+    char process_name[MAX_PROCESS_NAME];
+
+    pid = is_udp ? get_process_id_from_udp_connection_v6(src_ip6, src_port)
+                 : get_process_id_from_connection_v6(src_ip6, src_port);
+    if (out_pid) *out_pid = pid;
+    if (pid == 0) return RULE_ACTION_DIRECT;
+    if (pid == g_current_process_id) return RULE_ACTION_DIRECT;
+    if (!get_process_name_from_pid(pid, process_name, sizeof(process_name)))
+        return RULE_ACTION_DIRECT;
+
+    UINT32 proxy_config_id = 0;
+    RuleAction action = match_rule_v6(process_name, dest_ip6, dest_port, is_udp, &proxy_config_id);
+
+    if (action == RULE_ACTION_PROXY)
+    {
+        PROXY_CONFIG *cfg = find_healthy_proxy_config(proxy_config_id);
+        if (cfg == NULL || cfg->host[0] == '\0' || cfg->port == 0)
+            return RULE_ACTION_DIRECT;
+        if (is_udp && cfg->type == PROXY_TYPE_HTTP)
+            return RULE_ACTION_DIRECT;
+        proxy_config_id = cfg->config_id; // substitute failover-selected config
+    }
+    if (out_proxy_config_id) *out_proxy_config_id = proxy_config_id;
+    return action;
+}
+
+
+static BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size)
+{
+    HANDLE hProcess;
+    WCHAR full_path_w[MAX_PATH];
+    DWORD path_len = MAX_PATH;
+
+    if (pid == 0)
+    {
+        return FALSE;
+    }
+
+    // ERROR in getting process name for PID 4 reserved by system
+    // SMB is managed by system process
+    if (pid == 4)
+    {
+        strncpy_s(name, name_size, "System", _TRUNCATE);
+        return TRUE;
+    }
+
+    hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProcess == NULL)
+    {
+        return FALSE;
+    }
+
+    if (QueryFullProcessImageNameW(hProcess, 0, full_path_w, &path_len))
+    {
+        // Convert wide string to UTF-8 so Chinese/non-ASCII paths are preserved
+        int converted = WideCharToMultiByte(CP_UTF8, 0, full_path_w, -1, name, (int)name_size, NULL, NULL);
+        CloseHandle(hProcess);
+        return converted > 0;
+    }
+
+    CloseHandle(hProcess);
+    return FALSE;
+}
+
+// Match IP pattern against IP address
+// Supports: "*" (all), "192.168.1.1" (exact), "192.168.*.*" (wildcard)
+static BOOL match_ip_pattern(const char *pattern, UINT32 ip)
+{
+    if (pattern == NULL || strcmp(pattern, "*") == 0)
+        return TRUE;
+
+    // check for IP range
+    char *dash = strchr(pattern, '-');
+    if (dash != NULL)
+    {
+        char start_ip_str[64], end_ip_str[64];
+        size_t start_len = dash - pattern;
+        if (start_len >= sizeof(start_ip_str))
+            return FALSE;
+
+        strncpy_s(start_ip_str, sizeof(start_ip_str), pattern, start_len);
+        start_ip_str[start_len] = '\0';
+        strncpy_s(end_ip_str, sizeof(end_ip_str), dash + 1, _TRUNCATE);
+
+        // parse start and end IPs
+        UINT32 start_ip = 0, end_ip = 0;
+        int s1, s2, s3, s4, e1, e2, e3, e4;
+
+        if (sscanf_s(start_ip_str, "%d.%d.%d.%d", &s1, &s2, &s3, &s4) == 4 &&
+            sscanf_s(end_ip_str, "%d.%d.%d.%d", &e1, &e2, &e3, &e4) == 4)
+        {
+            start_ip = (s1 << 0) | (s2 << 8) | (s3 << 16) | (s4 << 24);
+            end_ip = (e1 << 0) | (e2 << 8) | (e3 << 16) | (e4 << 24);
+
+            // checking as network byte order would be wrong, compare as little-endian UINT32
+            // change to big-endian for proper comparison
+            UINT32 ip_be = ((ip & 0xFF) << 24) | ((ip & 0xFF00) << 8) | ((ip & 0xFF0000) >> 8) | ((ip & 0xFF000000) >> 24);
+            UINT32 start_be = ((start_ip & 0xFF) << 24) | ((start_ip & 0xFF00) << 8) | ((start_ip & 0xFF0000) >> 8) | ((start_ip & 0xFF000000) >> 24);
+            UINT32 end_be = ((end_ip & 0xFF) << 24) | ((end_ip & 0xFF00) << 8) | ((end_ip & 0xFF0000) >> 8) | ((end_ip & 0xFF000000) >> 24);
+
+            return (ip_be >= start_be && ip_be <= end_be);
+        }
+        return FALSE;
+    }
+
+    // Extract 4 octets from IP (little-endian)
+    unsigned char ip_octets[4];
+    ip_octets[0] = (ip >> 0) & 0xFF;
+    ip_octets[1] = (ip >> 8) & 0xFF;
+    ip_octets[2] = (ip >> 16) & 0xFF;
+    ip_octets[3] = (ip >> 24) & 0xFF;
+
+    // Parse pattern manually
+    char pattern_copy[256];
+    strncpy_s(pattern_copy, sizeof(pattern_copy), pattern, _TRUNCATE);
+
+    char pattern_octets[4][16];
+    int octet_count = 0;
+    int char_idx = 0;
+
+    size_t pat_len = strnlen_s(pattern_copy, sizeof(pattern_copy));
+    for (int i = 0; i <= (int)pat_len && octet_count < 4; i++)
+    {
+        if (pattern_copy[i] == '.' || pattern_copy[i] == '\0')
+        {
+            pattern_octets[octet_count][char_idx] = '\0';
+            octet_count++;
+            char_idx = 0;
+            if (pattern_copy[i] == '\0')
+                break;
+        }
+        else
+        {
+            if (char_idx < 15)
+                pattern_octets[octet_count][char_idx++] = pattern_copy[i];
+        }
+    }
+
+    if (octet_count != 4)
+        return FALSE;
+
+    for (int i = 0; i < 4; i++)
+    {
+        if (strcmp(pattern_octets[i], "*") == 0)
+            continue;
+        int pattern_val = atoi(pattern_octets[i]);
+        if (pattern_val != ip_octets[i])
+            return FALSE;
+    }
+    return TRUE;
+}
+
+// Match port pattern: "*", "80", "8000-9000"
+static BOOL match_port_pattern(const char *pattern, UINT16 port)
+{
+    if (pattern == NULL || strcmp(pattern, "*") == 0)
+        return TRUE;
+
+    char *dash = strchr(pattern, '-');
+    if (dash != NULL)
+    {
+        int start_port = atoi(pattern);
+        int end_port = atoi(dash + 1);
+        return (port >= start_port && port <= end_port);
+    }
+
+    return (port == atoi(pattern));
+}
+
+static BOOL ip_match_wrapper(const char *token, const void *data)
+{
+    return match_ip_pattern(token, *(const UINT32*)data);
+}
+
+// Match IP list: "192.168.*.*;10.0.0.1"
+static BOOL match_ip_list(const char *ip_list, UINT32 ip)
+{
+    return parse_token_list(ip_list, ";", ip_match_wrapper, &ip);
+}
+
+// Match IPv6 pattern against a 16-byte address.
+// Supports: "*" (all), exact ("::1", "2001:db8::1"),
+//           CIDR  ("2001:db8::/32", "fe80::/10"),
+//           range ("2001:db8::1-2001:db8::ff").
+// IPv4 patterns (no ':') never match an IPv6 address.
+static BOOL match_ip_pattern_v6(const char *pattern, const UINT8 ip6[16])
+{
+    if (pattern == NULL || strcmp(pattern, "*") == 0)
+        return TRUE;
+
+    // IPv4-only pattern: cannot match IPv6
+    if (strchr(pattern, ':') == NULL)
+        return FALSE;
+
+    char pat_copy[128];
+    strncpy_s(pat_copy, sizeof(pat_copy), pattern, _TRUNCATE);
+
+    // CIDR notation, e.g. "2001:db8::/32"
+    char *slash = strchr(pat_copy, '/');
+    if (slash != NULL)
+    {
+        *slash = '\0';
+        int prefix_len = atoi(slash + 1);
+        if (prefix_len < 0 || prefix_len > 128)
+            return FALSE;
+
+        UINT8 network[16];
+        if (inet_pton(AF_INET6, pat_copy, network) != 1)
+            return FALSE;
+
+        int full_bytes = prefix_len / 8;
+        int rem_bits   = prefix_len % 8;
+
+        if (full_bytes > 0 && memcmp(ip6, network, full_bytes) != 0)
+            return FALSE;
+
+        if (rem_bits > 0)
+        {
+            UINT8 mask = (UINT8)(0xFF << (8 - rem_bits));
+            if ((ip6[full_bytes] & mask) != (network[full_bytes] & mask))
+                return FALSE;
+        }
+        return TRUE;
+    }
+
+    // Range notation: "2001:db8::1-2001:db8::ff"
+    // IPv6 addresses contain no '-', so the first '-' is unambiguously the separator.
+    char *dash = strchr(pat_copy, '-');
+    if (dash != NULL)
+    {
+        *dash = '\0';
+        const char *end_str = dash + 1;
+
+        UINT8 start6[16], end6[16];
+        if (inet_pton(AF_INET6, pat_copy, start6) != 1 ||
+            inet_pton(AF_INET6, end_str,   end6)   != 1)
+            return FALSE;
+
+        // inet_pton produces network byte order (big-endian), so memcmp
+        // gives correct numeric ordering for IPv6 addresses.
+        return (memcmp(ip6, start6, 16) >= 0 &&
+                memcmp(ip6, end6,   16) <= 0);
+    }
+
+    // Exact IPv6 address match
+    UINT8 addr6[16];
+    if (inet_pton(AF_INET6, pattern, addr6) != 1)
+        return FALSE;
+    return memcmp(ip6, addr6, 16) == 0;
+}
+
+static BOOL ip_match_wrapper_v6(const char *token, const void *data)
+{
+    return match_ip_pattern_v6(token, (const UINT8*)data);
+}
+
+// Match IPv6 address against a semicolon-separated host list
+static BOOL match_ip_list_v6(const char *ip_list, const UINT8 ip6[16])
+{
+    return parse_token_list(ip_list, ";", ip_match_wrapper_v6, ip6);
+}
+
+static BOOL port_match_wrapper(const char *token, const void *data)
+{
+    return match_port_pattern(token, *(const UINT16*)data);
+}
+
+// Match port list: "80;443;8000-9000"
+static BOOL match_port_list(const char *port_list, UINT16 port)
+{
+    return parse_token_list(port_list, ",;", port_match_wrapper, &port);
+}
+
+// Match process name with wildcard support
+// Supports: "*" (all),
+// "chrome.exe" (exact), "fire*.exe" (wildcard), "*.bin" (extension wildcard)
+// added support for full paths - C:\Program Files\Google\Chrome\Application\chrome.exe
+// Nedd to Test all combination at sanme time
+// Case-insensitive wildcard match; '*' matches any sequence (including empty).
+// Handles multiple wildcards anywhere in the pattern, e.g. "*steam*", "fire*.exe".
+static BOOL wildcard_match(const char *pattern, const char *text)
+{
+    while (*text != '\0')
+    {
+        if (*pattern == '*')
+        {
+            while (*pattern == '*') pattern++;   // collapse consecutive *
+            if (*pattern == '\0') return TRUE;   // trailing * matches rest
+            while (*text != '\0')
+            {
+                if (wildcard_match(pattern, text))
+                    return TRUE;
+                text++;
+            }
+            return FALSE;
+        }
+        else
+        {
+            if (tolower((unsigned char)*pattern) != tolower((unsigned char)*text))
+                return FALSE;
+            pattern++;
+            text++;
+        }
+    }
+    while (*pattern == '*') pattern++;
+    return *pattern == '\0';
+}
+
+static BOOL match_process_pattern(const char *pattern, const char *process_full_path)
+{
+    if (pattern == NULL || strcmp(pattern, "*") == 0)
+        return TRUE;
+
+    // Extract just the filename from the full path for comparison
+    // Windows path sucks
+    const char *filename = strrchr(process_full_path, '\\');
+    if (filename != NULL)
+        filename++; // Skip the backslash
+    else
+        filename = process_full_path; // No path separator, use as-is
+
+    // Check if pattern contains path separators (backslash or forward slash)
+    BOOL is_full_path_pattern = (strchr(pattern, '\\') != NULL || strchr(pattern, '/') != NULL);
+
+    // match against full path if pattern has a path separator, otherwise filename only
+    const char *match_target = is_full_path_pattern ? process_full_path : filename;
+
+    // Wildcard pattern: use full wildcard matcher (handles *, *x*, x*y, etc.)
+    if (strchr(pattern, '*') != NULL)
+        return wildcard_match(pattern, match_target);
+
+    // No wildcard, plain case-insensitive comparison
+    return _stricmp(pattern, match_target) == 0;
+}
+
+// Match process list: "chrome.exe;firefox.exe;*.bin"
+static BOOL match_process_list(const char *process_list, const char *process_name)
+{
+    if (process_list == NULL || process_list[0] == '\0' || strcmp(process_list, "*") == 0)
+        return TRUE;
+
+    // Stack buffer for the common short case; malloc only for unusually long lists.
+    char   stackbuf[256];
+    size_t len   = strnlen_s(process_list, MAX_LIST_SIZE) + 1;
+    size_t dstsz = len;
+    char  *list_copy;
+    BOOL   on_heap = FALSE;
+    if (len <= sizeof(stackbuf))
+    {
+        list_copy = stackbuf;
+        dstsz     = sizeof(stackbuf);
+    }
+    else
+    {
+        list_copy = (char *)malloc(len);
+        if (list_copy == NULL)
+            return FALSE;
+        on_heap = TRUE;
+    }
+
+    strncpy_s(list_copy, dstsz, process_list, _TRUNCATE);
+    BOOL matched = FALSE;
+    char *context = NULL;
+
+    // Support both semicolon and comma as separators - Need to figure complex rules in CLI parsing
+    char *token = strtok_s(list_copy, ",;", &context);
+    while (token != NULL)
+    {
+        // Skip leading whitespace
+        while (*token == ' ' || *token == '\t')
+            token++;
+
+        // Remove trailing whitespace   // this shit cause error in CLI parsing
+        char *end = token + strnlen_s(token, MAX_LIST_SIZE) - 1;
+        while (end > token && (*end == ' ' || *end == '\t'))
+        {
+            *end = '\0';
+            end--;
+        }
+
+        // Remove quotes if present: "C:\some app.exe"  - Need to carefully handle this in CLI app
+        if (*token == '"' && strnlen_s(token, MAX_LIST_SIZE) > 1)
+        {
+            token++;
+            char *quote = strchr(token, '"');
+            if (quote != NULL)
+                *quote = '\0';
+        }
+
+        if (match_process_pattern(token, process_name))
+        {
+            matched = TRUE;
+            break;
+        }
+        token = strtok_s(NULL, ",;", &context);
+    }
+    if (on_heap)
+        free(list_copy);
+    return matched;
+}
+
+// Match a single domain pattern against a resolved hostname (case-insensitive).
+//   "*"              -> matches anything (no restriction)
+//   "google.com"     -> exact match only
+//   "*.google.com"   -> any subdomain AND the apex "google.com" itself
+//   "*google*"       -> generic wildcard (handled by wildcard_match)
+static BOOL match_domain_pattern(const char *pattern, const char *domain)
+{
+    if (pattern == NULL || pattern[0] == '\0' || strcmp(pattern, "*") == 0)
+        return TRUE;
+    if (domain == NULL || domain[0] == '\0')
+        return FALSE;
+
+    // "*.example.com" should also match the bare apex "example.com" (Proxifier/Clash convention).
+    if (pattern[0] == '*' && pattern[1] == '.' && pattern[2] != '\0')
+    {
+        if (_stricmp(pattern + 2, domain) == 0)
+            return TRUE;
+    }
+
+    if (strchr(pattern, '*') != NULL)
+        return wildcard_match(pattern, domain);
+
+    return _stricmp(pattern, domain) == 0;
+}
+
+// Match a resolved hostname against a semicolon/comma separated domain list.
+// Empty list or "*" means no restriction (matches anything, including unknown domain).
+static BOOL match_domain_list(const char *domain_list, const char *domain)
+{
+    if (domain_list == NULL || domain_list[0] == '\0' || strcmp(domain_list, "*") == 0)
+        return TRUE;
+    if (domain == NULL || domain[0] == '\0')
+        return FALSE;
+
+    // Stack buffer for the common short case; malloc only for unusually long lists.
+    char   stackbuf[256];
+    size_t len   = strnlen_s(domain_list, MAX_LIST_SIZE) + 1;
+    size_t dstsz = len;
+    char  *list_copy;
+    BOOL   on_heap = FALSE;
+    if (len <= sizeof(stackbuf))
+    {
+        list_copy = stackbuf;
+        dstsz     = sizeof(stackbuf);
+    }
+    else
+    {
+        list_copy = (char *)malloc(len);
+        if (list_copy == NULL)
+            return FALSE;
+        on_heap = TRUE;
+    }
+
+    strncpy_s(list_copy, dstsz, domain_list, _TRUNCATE);
+    BOOL matched = FALSE;
+    char *context = NULL;
+    char *token = strtok_s(list_copy, ",;", &context);
+    while (token != NULL)
+    {
+        while (*token == ' ' || *token == '\t')
+            token++;
+        char *end = token + strnlen_s(token, MAX_LIST_SIZE);
+        while (end > token && (end[-1] == ' ' || end[-1] == '\t'))
+            *(--end) = '\0';
+
+        if (token[0] != '\0' && match_domain_pattern(token, domain))
+        {
+            matched = TRUE;
+            break;
+        }
+        token = strtok_s(NULL, ",;", &context);
+    }
+    if (on_heap)
+        free(list_copy);
+    return matched;
+}
+
+// TRUE if the rule actually restricts by domain (non-empty and not "*").
+static BOOL rule_has_domain_filter(const PROCESS_RULE *rule)
+{
+    return rule->target_domains != NULL &&
+           rule->target_domains[0] != '\0' &&
+           strcmp(rule->target_domains, "*") != 0;
+}
+
+// Domain-filter gate used inside rule matching.
+//   - rule has no domain restriction  -> always TRUE (preserves pre-domain behaviour)
+//   - rule restricts by domain, IP has no resolved hostname -> FALSE (cache-miss: don't match)
+//   - otherwise -> match the resolved hostname against the rule's domain list
+static BOOL match_domain_filter(const PROCESS_RULE *rule, const char *domain)
+{
+    if (!rule_has_domain_filter(rule))
+        return TRUE;
+    if (domain == NULL || domain[0] == '\0')
+        return FALSE;
+    return match_domain_list(rule->target_domains, domain);
+}
+
+
+static BOOL is_broadcast_or_multicast(UINT32 ip)
+{
+    // note: Localhost (127.x.x.x) is now supported for proxying
+    // This allows intercepting localhost connections for MITM scenarios
+
+    BYTE first_octet = (ip >> 0) & 0xFF;
+    BYTE second_octet = (ip >> 8) & 0xFF;
+
+    // APIPA (Link-Local): 169.254.0.0/16 (169.254.x.x)
+    if (first_octet == 169 && second_octet == 254)
+        return TRUE;
+
+    // Broadcast: 255.255.255.255
+    if (ip == 0xFFFFFFFF)
+        return TRUE;
+
+    // x.x.x.255
+    if ((ip & 0xFF000000) == 0xFF000000)
+        return TRUE;
+
+    // Multicast: 224.0.0.0 - 239.255.255.255 (first octet 224-239)
+    if (first_octet >= 224 && first_octet <= 239)
+        return TRUE;
+
+    return FALSE;
+}
+
+// Unified rule matching function for both TCP and UDP
+// Matches rules by process name, IP, port, and protocol
+// Inner matcher - caller MUST hold g_rules_lock (shared) for the whole traversal so
+// rules_list and the strings it points to cannot be freed/edited mid-match.
+static RuleAction match_rule_inner(const char *process_name, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id)
+{
+    PROCESS_RULE *rule = rules_list;
+    PROCESS_RULE *wildcard_rule = NULL;  // Save fully wildcard rule for last
+
+    // Resolve the destination hostname once (only when domain rules exist) from the
+    // DNS-snoop cache. Reused for every rule's domain filter below. Cache miss -> unknown.
+    char domain[256];
+    const char *dst_domain = NULL;
+    if (g_has_domain_rules && dns_cache_lookup(dest_ip, domain, sizeof(domain)))
+        dst_domain = domain;
+
+    while (rule != NULL)
+    {
+        if (!rule->enabled)
+        {
+            rule = rule->next;
+            continue;
+        }
+
+        // Check protocol compatibility
+        // RULE_PROTOCOL_BOTH (0x03) matches both TCP and UDP
+        if (rule->protocol != RULE_PROTOCOL_BOTH)
+        {
+            if (rule->protocol == RULE_PROTOCOL_TCP && is_udp)
+            {
+                rule = rule->next;
+                continue;
+            }
+            if (rule->protocol == RULE_PROTOCOL_UDP && !is_udp)
+            {
+                rule = rule->next;
+                continue;
+            }
+        }
+
+        // Check if this is a wildcard process rule
+        BOOL is_wildcard_process = (strcmp(rule->process_name, "*") == 0 || strcmp(rule->process_name, "ANY") == 0);
+
+        if (is_wildcard_process)
+        {
+            // Check if wildcard has specific filters
+            BOOL has_ip_filter = (strcmp(rule->target_hosts, "*") != 0);
+            BOOL has_port_filter = (strcmp(rule->target_ports, "*") != 0);
+            BOOL has_domain_filter = rule_has_domain_filter(rule);
+
+            if (has_ip_filter || has_port_filter || has_domain_filter)
+            {
+                // Filtered wildcard - check if it matches
+                if (match_ip_list(rule->target_hosts, dest_ip) &&
+                    match_port_list(rule->target_ports, dest_port) &&
+                    match_domain_filter(rule, dst_domain))
+                {
+                    // Matched! Return this rule's action
+                    if (out_proxy_config_id != NULL) *out_proxy_config_id = rule->proxy_config_id;
+                    return rule->action;
+                }
+                // Didn't match, continue
+                rule = rule->next;
+                continue;
+            }
+
+            // Fully wildcard rule (no filters) - save for later
+            if (wildcard_rule == NULL)
+            {
+                wildcard_rule = rule;
+            }
+            rule = rule->next;
+            continue;
+        }
+
+        // Check if process name matches
+        if (match_process_list(rule->process_name, process_name))
+        {
+            // Process matched! Check IP, port and domain filters
+            if (match_ip_list(rule->target_hosts, dest_ip) &&
+                match_port_list(rule->target_ports, dest_port) &&
+                match_domain_filter(rule, dst_domain))
+            {
+                // All filters matched! Return this rule's action
+                if (out_proxy_config_id != NULL) *out_proxy_config_id = rule->proxy_config_id;
+                return rule->action;
+            }
+        }
+
+        rule = rule->next;
+    }
+
+    // No specific rule matched, use wildcard if available
+    if (wildcard_rule != NULL)
+    {
+        if (out_proxy_config_id != NULL) *out_proxy_config_id = wildcard_rule->proxy_config_id;
+        return wildcard_rule->action;
+    }
+
+    // No rule matched at all
+    if (out_proxy_config_id != NULL) *out_proxy_config_id = 0;
+    return RULE_ACTION_DIRECT;
+}
+
+// Public matcher - takes the shared rules lock so a concurrent AddRule/EditRule/
+// DeleteRule/MoveRule from the GUI thread cannot free a node/string mid-match.
+static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id)
+{
+    AcquireSRWLockShared(&g_rules_lock);
+    RuleAction action = match_rule_inner(process_name, dest_ip, dest_port, is_udp, out_proxy_config_id);
+    ReleaseSRWLockShared(&g_rules_lock);
+    return action;
+}
+
+// IPv6 variant of match_rule - uses match_ip_list_v6 for host patterns.
+// Supports exact addresses ("::1"), CIDR ("2001:db8::/32"), and wildcards ("*").
+// IPv4-format patterns in target_hosts are silently skipped for IPv6 traffic.
+// Caller MUST hold g_rules_lock (shared) - see match_rule_v6 wrapper below.
+static RuleAction match_rule_v6_inner(const char *process_name, const UINT8 dest_ip6[16], UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id)
+{
+    PROCESS_RULE *rule = rules_list;
+    PROCESS_RULE *wildcard_rule = NULL;
+
+    // Resolve the destination hostname once (only when domain rules exist) from the
+    // IPv6 DNS-snoop cache. Reused for every rule's domain filter below.
+    char domain[256];
+    const char *dst_domain = NULL;
+    if (g_has_domain_rules && dns_cache_lookup_v6(dest_ip6, domain, sizeof(domain)))
+        dst_domain = domain;
+
+    while (rule != NULL)
+    {
+        if (!rule->enabled)
+        {
+            rule = rule->next;
+            continue;
+        }
+
+        if (rule->protocol != RULE_PROTOCOL_BOTH)
+        {
+            if (rule->protocol == RULE_PROTOCOL_TCP && is_udp) { rule = rule->next; continue; }
+            if (rule->protocol == RULE_PROTOCOL_UDP && !is_udp) { rule = rule->next; continue; }
+        }
+
+        BOOL is_wildcard_process = (strcmp(rule->process_name, "*") == 0 || strcmp(rule->process_name, "ANY") == 0);
+
+        if (is_wildcard_process)
+        {
+            BOOL has_ip_filter   = (strcmp(rule->target_hosts, "*") != 0);
+            BOOL has_port_filter = (strcmp(rule->target_ports, "*") != 0);
+            BOOL has_domain_filter = rule_has_domain_filter(rule);
+
+            if (has_ip_filter || has_port_filter || has_domain_filter)
+            {
+                if (match_ip_list_v6(rule->target_hosts, dest_ip6) &&
+                    match_port_list(rule->target_ports, dest_port) &&
+                    match_domain_filter(rule, dst_domain))
+                {
+                    if (out_proxy_config_id != NULL) *out_proxy_config_id = rule->proxy_config_id;
+                    return rule->action;
+                }
+                rule = rule->next;
+                continue;
+            }
+
+            if (wildcard_rule == NULL)
+                wildcard_rule = rule;
+            rule = rule->next;
+            continue;
+        }
+
+        if (match_process_list(rule->process_name, process_name))
+        {
+            if (match_ip_list_v6(rule->target_hosts, dest_ip6) &&
+                match_port_list(rule->target_ports, dest_port) &&
+                match_domain_filter(rule, dst_domain))
+            {
+                if (out_proxy_config_id != NULL) *out_proxy_config_id = rule->proxy_config_id;
+                return rule->action;
+            }
+        }
+
+        rule = rule->next;
+    }
+
+    if (wildcard_rule != NULL)
+    {
+        if (out_proxy_config_id != NULL) *out_proxy_config_id = wildcard_rule->proxy_config_id;
+        return wildcard_rule->action;
+    }
+
+    if (out_proxy_config_id != NULL) *out_proxy_config_id = 0;
+    return RULE_ACTION_DIRECT;
+}
+
+static RuleAction match_rule_v6(const char *process_name, const UINT8 dest_ip6[16], UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id)
+{
+    AcquireSRWLockShared(&g_rules_lock);
+    RuleAction action = match_rule_v6_inner(process_name, dest_ip6, dest_port, is_udp, out_proxy_config_id);
+    ReleaseSRWLockShared(&g_rules_lock);
+    return action;
+}
+
+static RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, DWORD *out_pid, UINT32 *out_proxy_config_id)
+{
+    DWORD pid;
+    char process_name[MAX_PROCESS_NAME];
+
+    pid = is_udp ? get_process_id_from_udp_connection(src_ip, src_port) : get_process_id_from_connection(src_ip, src_port);
+    if (pid == 0 && is_udp)
+        pid = get_process_id_from_connection(src_ip, src_port);
+
+        // this may cause issues - need to find alternative
+    if (out_pid != NULL)
+        *out_pid = pid;
+
+    if (pid == 0)
+        return RULE_ACTION_DIRECT;
+
+    // Auto-exclude: Always bypass the process that loaded this DLL (prevents loops)
+    if (pid == g_current_process_id)
+        return RULE_ACTION_DIRECT;
+
+    if (!get_process_name_from_pid(pid, process_name, sizeof(process_name)))
+        return RULE_ACTION_DIRECT;
+
+    // Use unified rule matching function
+    UINT32 proxy_config_id = 0;
+    RuleAction action = match_rule(process_name, dest_ip, dest_port, is_udp, &proxy_config_id);
+
+    // Additional checks for proxy configuration
+    if (action == RULE_ACTION_PROXY)
+    {
+        PROXY_CONFIG *cfg = find_healthy_proxy_config(proxy_config_id);
+        if (cfg == NULL || cfg->host[0] == '\0' || cfg->port == 0)
+            return RULE_ACTION_DIRECT;  // No proxy configured
+
+        // UDP: HTTP proxy doesn't support UDP - use per-rule proxy config type
+        if (is_udp && cfg->type == PROXY_TYPE_HTTP)
+            return RULE_ACTION_DIRECT;
+
+        proxy_config_id = cfg->config_id; // substitute failover-selected config
+    }
+
+    if (out_proxy_config_id != NULL)
+        *out_proxy_config_id = proxy_config_id;
+
+    return action;
+}
+
+
+// Helper: find proxy config by ID; falls back to first config if not found
+static PROXY_CONFIG* find_proxy_config(UINT32 config_id)
+{
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        if (g_proxy_configs[i].config_id == config_id)
+            return &g_proxy_configs[i];
+    }
+    // Fall back to first available config
+    if (g_proxy_config_count > 0)
+        return &g_proxy_configs[0];
+    return NULL;
+}
+
+// ── Failover (Extended ProxyBridge) ─────────────────────────────────────────
+
+// Lightweight reachability probe: a plain non-blocking TCP connect to the proxy's
+// own host:port, nothing more. Deliberately does NOT attempt a SOCKS5/HTTP
+// handshake or reach through to any target - "is the proxy server itself up and
+// accepting TCP connections" is the right signal for failover, and it's cheap
+// enough to run every few seconds against every config without adding load.
+static BOOL check_proxy_reachable(PROXY_CONFIG *cfg, int timeout_ms)
+{
+    if (cfg == NULL || cfg->host[0] == '\0' || cfg->port == 0)
+        return FALSE;
+
+    UINT32 proxy_ip = cfg->resolved_ip ? cfg->resolved_ip : resolve_hostname(cfg->host);
+    if (proxy_ip == 0)
+        return FALSE;
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET)
+        return FALSE;
+
+    u_long nonblock = 1;
+    ioctlsocket(sock, FIONBIO, &nonblock);
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(cfg->port);
+    addr.sin_addr.s_addr = proxy_ip;
+
+    BOOL ok = FALSE;
+    int rc = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    if (rc == 0)
+    {
+        ok = TRUE; // connected immediately (e.g. proxy on localhost)
+    }
+    else if (WSAGetLastError() == WSAEWOULDBLOCK)
+    {
+        fd_set wfds, efds;
+        FD_ZERO(&wfds);
+        FD_ZERO(&efds);
+        FD_SET(sock, &wfds);
+        FD_SET(sock, &efds);
+        struct timeval tv;
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+        if (select(0, NULL, &wfds, &efds, &tv) > 0 && FD_ISSET(sock, &wfds) && !FD_ISSET(sock, &efds))
+        {
+            int err = 0;
+            int errlen = sizeof(err);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&err, &errlen) == 0 && err == 0)
+                ok = TRUE;
+        }
+    }
+
+    closesocket(sock);
+    return ok;
+}
+
+// Background loop started by ProxyBridge_SetHealthCheckEnabled(TRUE, ...). Probes
+// every configured proxy on a fixed interval and updates its is_healthy flag
+// atomically. Runs until g_healthcheck_stop_event is signalled.
+static DWORD WINAPI healthcheck_thread_proc(LPVOID arg)
+{
+    (void)arg;
+    while (g_healthcheck_enabled)
+    {
+        int count = g_proxy_config_count;
+        for (int i = 0; i < count && i < MAX_PROXY_CONFIGS; i++)
+        {
+            PROXY_CONFIG *cfg = &g_proxy_configs[i];
+            if (cfg->config_id == 0)
+                continue;
+
+            BOOL reachable = check_proxy_reachable(cfg, 2500);
+            LONG was_healthy = InterlockedExchange(&cfg->is_healthy, reachable ? 1 : 0);
+
+            if (was_healthy && !reachable)
+                log_message("Health check: proxy config ID %u (%s:%u) went DOWN", cfg->config_id, cfg->host, cfg->port);
+            else if (!was_healthy && reachable)
+                log_message("Health check: proxy config ID %u (%s:%u) is back UP", cfg->config_id, cfg->host, cfg->port);
+        }
+
+        if (WaitForSingleObject(g_healthcheck_stop_event, g_healthcheck_interval_sec * 1000) == WAIT_OBJECT_0)
+            break; // stop event signalled
+    }
+    return 0;
+}
+
+// Resolves a rule's assigned proxy_config_id to the first HEALTHY config in its
+// fallback chain (config_id -> fallback_config_id -> fallback_config_id -> ...).
+// With health-check disabled (default; zero behaviour change for every existing
+// profile/GUI setup that has never heard of failover), this is exactly
+// find_proxy_config(config_id). Chain walk is capped at MAX_PROXY_CONFIGS hops
+// so a fallback link accidentally set up as a cycle still terminates.
+static PROXY_CONFIG* find_healthy_proxy_config(UINT32 config_id)
+{
+    if (!g_healthcheck_enabled)
+        return find_proxy_config(config_id);
+
+    UINT32 id = config_id;
+    PROXY_CONFIG *first = NULL;
+
+    for (int hop = 0; hop < MAX_PROXY_CONFIGS && id != 0; hop++)
+    {
+        PROXY_CONFIG *cfg = NULL;
+        for (int i = 0; i < g_proxy_config_count; i++)
+        {
+            if (g_proxy_configs[i].config_id == id)
+            {
+                cfg = &g_proxy_configs[i];
+                break;
+            }
+        }
+        if (cfg == NULL)
+            break;
+        if (first == NULL)
+            first = cfg;
+
+        if (InterlockedCompareExchange(&cfg->is_healthy, 1, 1)) // atomic read, value unchanged
+            return cfg; // first healthy config in the chain wins
+
+        id = cfg->fallback_config_id;
+    }
+
+    // Whole chain is down (or config_id didn't exist at all). Returning the
+    // primary keeps existing "cfg==NULL / empty host -> DIRECT" logic in the
+    // caller working exactly as before, rather than introducing a new NULL path.
+    return first;
+}
+
+// Helper: check if any proxy config is SOCKS5 (needed to decide whether to start UDP relay)
+static BOOL any_socks5_config(void)
+{
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        if (g_proxy_configs[i].type == PROXY_TYPE_SOCKS5 &&
+            g_proxy_configs[i].host[0] != '\0' &&
+            g_proxy_configs[i].port != 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// dns cache
+static void dns_cache_init(void)
+{
+    InitializeSRWLock(&g_dns_cache_lock);
+    memset(g_dns_cache,    0, sizeof(g_dns_cache));
+    memset(g_dns_cache_v6, 0, sizeof(g_dns_cache_v6));
+}
+
+static UINT32 dns_bucket(UINT32 ip)
+{
+    return (ip * 2654435761u) >> (32 - 10);  // Knuth multiplicative hash 1024 buckets
+}
+
+static void dns_cache_store(UINT32 ip, const char *domain)
+{
+    if (!domain || domain[0] == '\0') return;
+    UINT32 bucket = dns_bucket(ip);
+    ULONGLONG now = GetTickCount64();
+
+    AcquireSRWLockExclusive(&g_dns_cache_lock);
+    DNS_CACHE_ENTRY *e = g_dns_cache[bucket];
+    while (e)
+    {
+        if (e->ip == ip)
+        {
+            strncpy_s(e->domain, sizeof(e->domain), domain, _TRUNCATE);
+            e->expire_tick = now + DNS_CACHE_TTL_MS;
+            ReleaseSRWLockExclusive(&g_dns_cache_lock);
+            return;
+        }
+        e = e->next;
+    }
+    DNS_CACHE_ENTRY *ne = (DNS_CACHE_ENTRY *)malloc(sizeof(DNS_CACHE_ENTRY));
+    if (ne)
+    {
+        ne->ip         = ip;
+        ne->expire_tick = now + DNS_CACHE_TTL_MS;
+        strncpy_s(ne->domain, sizeof(ne->domain), domain, _TRUNCATE);
+        ne->next           = g_dns_cache[bucket];
+        g_dns_cache[bucket] = ne;
+    }
+    ReleaseSRWLockExclusive(&g_dns_cache_lock);
+}
+
+static BOOL dns_cache_lookup(UINT32 ip, char *out_domain, size_t out_size)
+{
+    UINT32 bucket = dns_bucket(ip);
+    ULONGLONG now = GetTickCount64();
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&g_dns_cache_lock);
+    DNS_CACHE_ENTRY *e = g_dns_cache[bucket];
+    while (e)
+    {
+        if (e->ip == ip && e->expire_tick > now)
+        {
+            strncpy_s(out_domain, out_size, e->domain, _TRUNCATE);
+            found = TRUE;
+            break;
+        }
+        e = e->next;
+    }
+    ReleaseSRWLockShared(&g_dns_cache_lock);
+    return found;
+}
+
+static UINT32 dns_bucket_v6(const UINT8 ip6[16])
+{
+    // FNV-1a over 16 bytes, folded to DNS_CACHE_BUCKETS
+    UINT32 h = 2166136261u;
+    for (int i = 0; i < 16; i++)
+        h = (h ^ ip6[i]) * 16777619u;
+    return h & (DNS_CACHE_BUCKETS - 1);
+}
+
+static void dns_cache_store_v6(const UINT8 ip6[16], const char *domain)
+{
+    if (!domain || domain[0] == '\0') return;
+    UINT32 bucket = dns_bucket_v6(ip6);
+    ULONGLONG now = GetTickCount64();
+
+    AcquireSRWLockExclusive(&g_dns_cache_lock);
+    DNS_CACHE_ENTRY_V6 *e = g_dns_cache_v6[bucket];
+    while (e)
+    {
+        if (memcmp(e->ip6, ip6, 16) == 0)
+        {
+            strncpy_s(e->domain, sizeof(e->domain), domain, _TRUNCATE);
+            e->expire_tick = now + DNS_CACHE_TTL_MS;
+            ReleaseSRWLockExclusive(&g_dns_cache_lock);
+            return;
+        }
+        e = e->next;
+    }
+    DNS_CACHE_ENTRY_V6 *ne = (DNS_CACHE_ENTRY_V6 *)malloc(sizeof(DNS_CACHE_ENTRY_V6));
+    if (ne)
+    {
+        memcpy(ne->ip6, ip6, 16);
+        ne->expire_tick = now + DNS_CACHE_TTL_MS;
+        strncpy_s(ne->domain, sizeof(ne->domain), domain, _TRUNCATE);
+        ne->next = g_dns_cache_v6[bucket];
+        g_dns_cache_v6[bucket] = ne;
+    }
+    ReleaseSRWLockExclusive(&g_dns_cache_lock);
+}
+
+static BOOL dns_cache_lookup_v6(const UINT8 ip6[16], char *out_domain, size_t out_size)
+{
+    UINT32 bucket = dns_bucket_v6(ip6);
+    ULONGLONG now = GetTickCount64();
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&g_dns_cache_lock);
+    DNS_CACHE_ENTRY_V6 *e = g_dns_cache_v6[bucket];
+    while (e)
+    {
+        if (memcmp(e->ip6, ip6, 16) == 0 && e->expire_tick > now)
+        {
+            strncpy_s(out_domain, out_size, e->domain, _TRUNCATE);
+            found = TRUE;
+            break;
+        }
+        e = e->next;
+    }
+    ReleaseSRWLockShared(&g_dns_cache_lock);
+    return found;
+}
+
+// Parse a DNS name (with pointer compression) at msg[*offset] into dst.
+// Advances *offset past the name on success.
+static BOOL dns_parse_name(const UINT8 *msg, int msg_len, int *offset, char *dst, int dst_len)
+{
+    int pos    = *offset;
+    int out    = 0;
+    int jumps  = 0;
+    BOOL jumped      = FALSE;
+    int  jumped_end  = -1;
+
+    while (pos < msg_len)
+    {
+        UINT8 b = msg[pos];
+        if (b == 0x00)
+        {
+            dst[out] = '\0';
+            if (!jumped) *offset = pos + 1;
+            else         *offset = jumped_end;
+            return TRUE;
+        }
+        if ((b & 0xC0) == 0xC0)
+        {
+            if (pos + 1 >= msg_len) return FALSE;
+            if (!jumped) jumped_end = pos + 2;
+            jumped = TRUE;
+            pos = ((b & 0x3F) << 8) | msg[pos + 1];
+            if (++jumps > 10) return FALSE;
+            continue;
+        }
+        int label_len = (int)b;
+        pos++;
+        if (pos + label_len > msg_len)       return FALSE;
+        if (out + label_len + 2 >= dst_len)  return FALSE;
+        if (out > 0) dst[out++] = '.';
+        memcpy(&dst[out], &msg[pos], label_len);
+        out  += label_len;
+        pos  += label_len;
+    }
+    return FALSE;
+}
+
+// Snoop an inbound DNS response (UDP payload starting at the DNS header).
+// For every A-record answer, store ip → qname in the DNS cache.
+static void snoop_dns_response(const UINT8 *payload, int payload_len)
+{
+    if (payload_len < 12) return;
+
+    UINT16 flags   = ((UINT16)payload[2] << 8) | payload[3];
+    if (!(flags & 0x8000)) return;   // not a response
+    if  (flags & 0x000F)   return;   // RCODE != NOERROR
+
+    UINT16 qdcount = ((UINT16)payload[4] << 8) | payload[5];
+    UINT16 ancount = ((UINT16)payload[6] << 8) | payload[7];
+    if (ancount == 0) return;
+
+    int offset = 12;
+
+    // Extract the first question's name as the canonical hostname for this answer.
+    char qname[256];
+    if (!dns_parse_name(payload, payload_len, &offset, qname, sizeof(qname))) return;
+    offset += 4;  // QTYPE + QCLASS
+
+    // Skip any remaining questions
+    for (int q = 1; q < qdcount && offset < payload_len; q++)
+    {
+        char tmp[256];
+        if (!dns_parse_name(payload, payload_len, &offset, tmp, sizeof(tmp))) return;
+        offset += 4;
+    }
+
+    // Parse answer RRs
+    for (int i = 0; i < ancount && offset < payload_len; i++)
+    {
+        char rname[256];
+        if (!dns_parse_name(payload, payload_len, &offset, rname, sizeof(rname))) return;
+        if (offset + 10 > payload_len) return;
+
+        UINT16 rtype  = ((UINT16)payload[offset + 0] << 8) | payload[offset + 1];
+        UINT16 rclass = ((UINT16)payload[offset + 2] << 8) | payload[offset + 3];
+        UINT16 rdlen  = ((UINT16)payload[offset + 8] << 8) | payload[offset + 9];
+        offset += 10;
+        if (offset + rdlen > payload_len) return;
+
+        if (rtype == 1 /* A */ && rclass == 1 /* IN */ && rdlen == 4)
+        {
+            UINT32 ip;
+            memcpy(&ip, &payload[offset], 4);  // network-byte-order, matches ip_header->DstAddr
+            dns_cache_store(ip, qname);
+        }
+        else if (rtype == 28 /* AAAA */ && rclass == 1 /* IN */ && rdlen == 16)
+        {
+            dns_cache_store_v6(&payload[offset], qname);
+        }
+        offset += rdlen;
+    }
+}
+
+// Read and validate a SOCKS5 CONNECT reply accoring to RFC 1928
+// Goal -  The proxy picks the BND.ADDR
+// type in its reply  seperatly of the request's ATYP few proxies answer an IPv6 CONNECT with a 4-byte IPv4 0.0.0.0 BND.addr
+//  parse the 4-byte header
+// (VER REP RSV ATYP) and then drain the variable-length BND.ADDR + BND.PORT by ATYP
+static int socks5_read_connect_reply(SOCKET s, int *reply)
+{
+    unsigned char hdr[4];
+    int len = recv_n(s, (char*)hdr, 4);
+    if (reply) *reply = (len >= 2) ? hdr[1] : -1;
+    if (len != 4 || hdr[0] != SOCKS5_VERSION || hdr[1] != 0x00) return -1;
+
+    int drain;
+    if      (hdr[3] == SOCKS5_ATYP_IPV4) drain = 4 + 2;
+    else if (hdr[3] == SOCKS5_ATYP_IPV6) drain = 16 + 2;
+    else if (hdr[3] == SOCKS5_ATYP_DOMAIN)
+    {
+        unsigned char dlen;
+        if (recv_n(s, (char*)&dlen, 1) != 1) return -1;
+        drain = (int)dlen + 2;
+    }
+    else return -1;   // unknown ATYP
+
+    unsigned char scratch[270];   // max drain = 255 + 2 (domain) < 270
+    if (drain > 0 && recv_n(s, (char*)scratch, drain) != drain) return -1;
+    return 0;
+}
+
+// SOCKS5 CONNECT with ATYP_DOMAIN
+
+static int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port, const PROXY_CONFIG *cfg)
+{
+    unsigned char buf[SOCKS5_BUFFER_SIZE];
+    int len;
+    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
+
+    buf[0] = SOCKS5_VERSION;
+    if (use_auth) { buf[1] = 0x02; buf[2] = SOCKS5_AUTH_NONE; buf[3] = 0x02; if (send(s, (char*)buf, 4, 0) != 4) return -1; }
+    else          { buf[1] = 0x01; buf[2] = SOCKS5_AUTH_NONE;                 if (send(s, (char*)buf, 3, 0) != 3) return -1; }
+
+    len = recv_n(s, (char*)buf, 2);
+    if (len != 2 || buf[0] != SOCKS5_VERSION) return -1;
+
+    if (buf[1] == 0x02)
+    {
+        if (!use_auth) return -1;
+        size_t user_len = strnlen_s(cfg->username, sizeof(cfg->username));
+        size_t pass_len = strnlen_s(cfg->password, sizeof(cfg->password));
+        if (user_len > 255 || pass_len > 255) return -1;
+        buf[0] = 0x01; buf[1] = (unsigned char)user_len;
+        memcpy(&buf[2], cfg->username, user_len);
+        buf[2 + user_len] = (unsigned char)pass_len;
+        memcpy(&buf[3 + user_len], cfg->password, pass_len);
+        if (send(s, (char*)buf, (int)(3 + user_len + pass_len), 0) != (int)(3 + user_len + pass_len)) return -1;
+        len = recv_n(s, (char*)buf, 2);
+        if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00) return -1;
+    }
+    else if (buf[1] != SOCKS5_AUTH_NONE) return -1;
+
+    // Build CONNECT request with ATYP_DOMAIN
+    size_t hlen = strnlen_s(hostname, 255);
+    if (hlen == 0 || hlen > 255) return -1;
+
+    buf[0] = SOCKS5_VERSION;
+    buf[1] = SOCKS5_CMD_CONNECT;
+    buf[2] = 0x00;
+    buf[3] = SOCKS5_ATYP_DOMAIN;
+    buf[4] = (unsigned char)hlen;
+    memcpy(&buf[5], hostname, hlen);
+    buf[5 + hlen] = (dest_port >> 8) & 0xFF;
+    buf[6 + hlen] = (dest_port >> 0) & 0xFF;
+    int req_len = (int)(7 + hlen);
+
+    if (send(s, (char*)buf, req_len, 0) != req_len) return -1;
+
+    int reply;
+    if (socks5_read_connect_reply(s, &reply) != 0)
+    {
+        log_message("SOCKS5 domain: CONNECT failed (reply=%d)", reply);
+        return -1;
+    }
+    return 0;
+}
+
+
+static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg)
+{
+    unsigned char buf[SOCKS5_BUFFER_SIZE];
+    int len;
+    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
+
+    buf[0] = SOCKS5_VERSION;
+    if (use_auth)
+    {
+        buf[1] = 0x02;  // Number of methods
+        buf[2] = SOCKS5_AUTH_NONE;
+        buf[3] = 0x02;  // Username/password auth
+        if (send(s, (char*)buf, 4, 0) != 4)
+        {
+            log_message("SOCKS5: Failed to send auth methods");
+            return -1;
+        }
+    }
+    else
+    {
+        buf[1] = 0x01;  // Number of methods
+        buf[2] = SOCKS5_AUTH_NONE;
+        if (send(s, (char*)buf, 3, 0) != 3)
+        {
+            log_message("SOCKS5: Failed to send auth methods");
+            return -1;
+        }
+    }
+
+    len = recv_n(s, (char*)buf, 2);
+    if (len != 2 || buf[0] != SOCKS5_VERSION)
+    {
+        log_message("SOCKS5: Invalid auth response");
+        return -1;
+    }
+
+    // Handle authentication
+    if (buf[1] == 0x02)  // Username/password required
+    {
+        if (!use_auth)
+        {
+            log_message("SOCKS5: Server requires authentication but no credentials provided");
+            return -1;
+        }
+
+        // Send username/password (RFC 1929)
+        size_t user_len = strnlen_s(cfg->username, sizeof(cfg->username));
+        size_t pass_len = strnlen_s(cfg->password, sizeof(cfg->password));
+        if (user_len > 255 || pass_len > 255)
+        {
+            log_message("SOCKS5: Username or password too long");
+            return -1;
+        }
+
+        buf[0] = 0x01;  // Version of username/password auth
+        buf[1] = (unsigned char)user_len;
+        memcpy(&buf[2], cfg->username, user_len);
+        buf[2 + user_len] = (unsigned char)pass_len;
+        memcpy(&buf[3 + user_len], cfg->password, pass_len);
+
+        if (send(s, (char*)buf, 3 + user_len + pass_len, 0) != (int)(3 + user_len + pass_len))
+        {
+            log_message("SOCKS5: Failed to send credentials");
+            return -1;
+        }
+
+        len = recv_n(s, (char*)buf, 2);
+        if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00)
+        {
+            log_message("SOCKS5: Authentication failed");
+            return -1;
+        }
+        log_message("SOCKS5: Authentication successful");
+    }
+    else if (buf[1] != SOCKS5_AUTH_NONE)
+    {
+        log_message("SOCKS5: Unsupported auth method: 0x%02X", buf[1]);
+        return -1;
+    }
+
+    buf[0] = SOCKS5_VERSION;
+    buf[1] = SOCKS5_CMD_CONNECT;
+    buf[2] = 0x00;
+    buf[3] = SOCKS5_ATYP_IPV4;
+    buf[4] = (dest_ip >> 0) & 0xFF;
+    buf[5] = (dest_ip >> 8) & 0xFF;
+    buf[6] = (dest_ip >> 16) & 0xFF;
+    buf[7] = (dest_ip >> 24) & 0xFF;
+    buf[8] = (dest_port >> 8) & 0xFF;
+    buf[9] = (dest_port >> 0) & 0xFF;
+
+    if (send(s, (char*)buf, 10, 0) != 10)
+    {
+        log_message("SOCKS5: Failed to send CONNECT");
+        return -1;
+    }
+
+    int reply;
+    if (socks5_read_connect_reply(s, &reply) != 0)
+    {
+        log_message("SOCKS5: CONNECT failed (reply=%d)", reply);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, const PROXY_CONFIG *cfg)
+{
+    unsigned char buf[SOCKS5_BUFFER_SIZE];
+    int len;
+    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
+
+    buf[0] = SOCKS5_VERSION;
+    if (use_auth) { buf[1] = 0x02; buf[2] = SOCKS5_AUTH_NONE; buf[3] = 0x02; if (send(s, (char*)buf, 4, 0) != 4) return -1; }
+    else          { buf[1] = 0x01; buf[2] = SOCKS5_AUTH_NONE;                 if (send(s, (char*)buf, 3, 0) != 3) return -1; }
+
+    len = recv_n(s, (char*)buf, 2);
+    if (len != 2 || buf[0] != SOCKS5_VERSION) return -1;
+
+    if (buf[1] == 0x02)
+    {
+        if (!use_auth) return -1;
+        size_t ul = strnlen_s(cfg->username, sizeof(cfg->username));
+        size_t pl = strnlen_s(cfg->password, sizeof(cfg->password));
+        if (ul > 255 || pl > 255) return -1;
+        buf[0] = 0x01; buf[1] = (unsigned char)ul;
+        memcpy(&buf[2], cfg->username, ul);
+        buf[2 + ul] = (unsigned char)pl;
+        memcpy(&buf[3 + ul], cfg->password, pl);
+        if (send(s, (char*)buf, (int)(3 + ul + pl), 0) != (int)(3 + ul + pl)) return -1;
+        len = recv_n(s, (char*)buf, 2);
+        if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00) return -1;
+    }
+    else if (buf[1] != SOCKS5_AUTH_NONE) return -1;
+
+    buf[0] = SOCKS5_VERSION;
+    buf[1] = SOCKS5_CMD_CONNECT;
+    buf[2] = 0x00;
+    buf[3] = SOCKS5_ATYP_IPV6;
+    memcpy(&buf[4], dest_ip6, 16);
+    buf[20] = (dest_port >> 8) & 0xFF;
+    buf[21] = (dest_port >> 0) & 0xFF;
+
+    if (send(s, (char*)buf, 22, 0) != 22) return -1;
+
+    // The proxy may reply with any BND.ADDR type (often IPv4 0.0.0.0), not necessarily
+    // IPv6 - so parse the reply by ATYP instead of demanding a fixed 22-byte response.
+    int reply;
+    if (socks5_read_connect_reply(s, &reply) != 0)
+    {
+        log_message("SOCKS5 IPv6: CONNECT failed (reply=%d)", reply);
+        return -1;
+    }
+    return 0;
+}
+
+static int http_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, const PROXY_CONFIG *cfg)
+{
+    char request[HTTP_BUFFER_SIZE];
+    char response[4096];
+    int len;
+    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
+
+    // Format IPv6 address as [addr]:port per RFC 2732
+    char addr_str[64];
+    inet_ntop(AF_INET6, dest_ip6, addr_str, sizeof(addr_str));
+
+    // Use cached domain name if available so the proxy sees the hostname
+    char cached_domain[256];
+    const char *host_part;
+    char host_buf[270];  // big enough for [ipv6]:port or domain
+    if (dns_cache_lookup_v6(dest_ip6, cached_domain, sizeof(cached_domain)))
+    {
+        host_part = cached_domain;
+        strncpy_s(host_buf, sizeof(host_buf), cached_domain, _TRUNCATE);
+    }
+    else
+    {
+        snprintf(host_buf, sizeof(host_buf), "[%s]", addr_str);
+        host_part = host_buf;
+    }
+
+    if (use_auth)
+    {
+        char credentials[SOCKS5_BUFFER_SIZE], encoded[HTTP_BUFFER_SIZE];
+        snprintf(credentials, sizeof(credentials), "%s:%s", cfg->username, cfg->password);
+        base64_encode(credentials, encoded, sizeof(encoded));
+        len = snprintf(request, sizeof(request),
+            "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Authorization: Basic %s\r\nProxy-Connection: keep-alive\r\n\r\n",
+            host_part, dest_port, host_part, dest_port, encoded);
+    }
+    else
+    {
+        len = snprintf(request, sizeof(request),
+            "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Connection: keep-alive\r\n\r\n",
+            host_part, dest_port, host_part, dest_port);
+    }
+
+    if (send(s, request, len, 0) != len) return -1;
+
+    len = recv(s, response, sizeof(response) - 1, 0);
+    if (len <= 0 || len >= (int)sizeof(response)) return -1;
+    response[len] = '\0';
+    char *code_start = strchr(response, ' ');
+    if (!code_start || atoi(code_start + 1) != 200) return -1;
+    return 0;
+}
+
+
+
+static void base64_encode(const char* input, char* output, size_t output_size)
+{
+    static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t input_len = strnlen_s(input, output_size * 2);
+    size_t output_len = 0;
+
+    for (size_t i = 0; i < input_len && output_len < output_size - 4; i += 3)
+    {
+        unsigned char b1 = input[i];
+        unsigned char b2 = (i + 1 < input_len) ? input[i + 1] : 0;
+        unsigned char b3 = (i + 2 < input_len) ? input[i + 2] : 0;
+
+        output[output_len++] = base64_chars[b1 >> 2];
+        output[output_len++] = base64_chars[((b1 & 0x03) << 4) | (b2 >> 4)];
+        output[output_len++] = (i + 1 < input_len) ? base64_chars[((b2 & 0x0F) << 2) | (b3 >> 6)] : '=';
+        output[output_len++] = (i + 2 < input_len) ? base64_chars[b3 & 0x3F] : '=';
+    }
+    output[output_len] = '\0';
+}
+
+static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg)
+{
+    char request[HTTP_BUFFER_SIZE];
+    char response[4096];
+    int len;
+    char *status_line;
+    int status_code;
+    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
+
+    // Use cached domain name if available so the proxy sees the hostname
+    char cached_domain[256];
+    char ip_str[32];
+    const char *host_part;
+    if (dns_cache_lookup(dest_ip, cached_domain, sizeof(cached_domain)))
+    {
+        host_part = cached_domain;
+    }
+    else
+    {
+        format_ip_address(dest_ip, ip_str, sizeof(ip_str));
+        host_part = ip_str;
+    }
+
+    if (use_auth)
+    {
+        // Create "username:password" string and encode as Base64
+        char credentials[SOCKS5_BUFFER_SIZE];
+        char encoded[HTTP_BUFFER_SIZE];
+        snprintf(credentials, sizeof(credentials), "%s:%s", cfg->username, cfg->password);
+        base64_encode(credentials, encoded, sizeof(encoded));
+
+        len = snprintf(request, sizeof(request),
+            "CONNECT %s:%d HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Proxy-Authorization: Basic %s\r\n"
+            "Proxy-Connection: keep-alive\r\n"
+            "\r\n",
+            host_part, dest_port, host_part, dest_port, encoded);
+    }
+    else
+    {
+        len = snprintf(request, sizeof(request),
+            "CONNECT %s:%d HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Proxy-Connection: keep-alive\r\n"
+            "\r\n",
+            host_part, dest_port, host_part, dest_port);
+    }
+
+    if (send(s, request, len, 0) != len)
+    {
+        log_message("HTTP: Failed to send CONNECT request");
+        return -1;
+    }
+
+    len = recv(s, response, sizeof(response) - 1, 0);
+    if (len <= 0 || len >= (int)sizeof(response))
+    {
+        log_message("HTTP: Failed to receive response");
+        return -1;
+    }
+    response[len] = '\0';
+
+    status_line = response;
+    if (strncmp(status_line, "HTTP/1.", 7) != 0)
+    {
+        log_message("HTTP: Invalid response format");
+        return -1;
+    }
+
+    status_code = 0;
+    char *code_start = strchr(status_line, ' ');
+    if (code_start != NULL)
+        status_code = atoi(code_start + 1);
+
+    if (status_code != 200)
+    {
+        log_message("HTTP: CONNECT failed with status %d", status_code);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, const PROXY_CONFIG *cfg)
+{
+    unsigned char buf[SOCKS5_BUFFER_SIZE];
+    int len;
+    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
+
+    buf[0] = SOCKS5_VERSION;
+    if (use_auth)
+    {
+        buf[1] = 0x02;
+        buf[2] = SOCKS5_AUTH_NONE;
+        buf[3] = 0x02;
+        if (send(s, (char*)buf, 4, 0) != 4)
+            return -1;
+    }
+    else
+    {
+        buf[1] = 0x01;
+        buf[2] = SOCKS5_AUTH_NONE;
+        if (send(s, (char*)buf, 3, 0) != 3)
+            return -1;
+    }
+
+    len = recv_n(s, (char*)buf, 2);
+    if (len != 2 || buf[0] != SOCKS5_VERSION)
+        return -1;
+
+    if (buf[1] == 0x02)
+    {
+        if (!use_auth)
+            return -1;
+
+        size_t user_len = strnlen_s(cfg->username, sizeof(cfg->username));
+        size_t pass_len = strnlen_s(cfg->password, sizeof(cfg->password));
+        if (user_len > 255 || pass_len > 255)
+            return -1;
+
+        buf[0] = 0x01;
+        buf[1] = (unsigned char)user_len;
+        memcpy(&buf[2], cfg->username, user_len);
+        buf[2 + user_len] = (unsigned char)pass_len;
+        memcpy(&buf[3 + user_len], cfg->password, pass_len);
+
+        if (send(s, (char*)buf, 3 + user_len + pass_len, 0) != (int)(3 + user_len + pass_len))
+            return -1;
+
+        len = recv_n(s, (char*)buf, 2);
+        if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00)
+            return -1;
+    }
+    else if (buf[1] != SOCKS5_AUTH_NONE)
+    {
+        return -1;
+    }
+
+    buf[0] = SOCKS5_VERSION;
+    buf[1] = SOCKS5_CMD_UDP_ASSOCIATE;
+    buf[2] = 0x00;
+    buf[3] = SOCKS5_ATYP_IPV4;
+    buf[4] = 0;
+    buf[5] = 0;
+    buf[6] = 0;
+    buf[7] = 0;
+    buf[8] = 0;
+    buf[9] = 0;
+
+    if (send(s, (char*)buf, 10, 0) != 10)
+        return -1;
+
+    len = recv_n(s, (char*)buf, 10);
+    if (len < 10 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00)
+        return -1;
+
+    relay_addr->sin_family = AF_INET;
+    relay_addr->sin_addr.s_addr = *(UINT32*)&buf[4];
+    relay_addr->sin_port = *(UINT16*)&buf[8];
+
+    return 0;
+}
+
+// TRUE if any enabled PROXY rule routes traffic through this proxy config. Used to skip
+// proactively establishing UDP ASSOCIATE for configs that no rule uses - otherwise the
+// relay wastes time (and can stall on a dead/unreachable host) connecting to proxies that
+// will never carry traffic. A rule with proxy_config_id 0 means "first available", which
+// could resolve to any config, so its presence marks all configs as potentially used.
+static BOOL is_proxy_config_referenced(UINT32 config_id)
+{
+    BOOL referenced = FALSE;
+    AcquireSRWLockShared(&g_rules_lock);
+    for (PROCESS_RULE *r = rules_list; r != NULL; r = r->next)
+    {
+        if (!r->enabled || r->action != RULE_ACTION_PROXY)
+            continue;
+        if (r->proxy_config_id == config_id || r->proxy_config_id == 0)
+        {
+            referenced = TRUE;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_rules_lock);
+    return referenced;
+}
+
+// connect UDP ASSOCIATE with SOCKS5 proxy (per proxy config)
+static BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg)
+{
+    if (cfg == NULL || cfg->host[0] == '\0' || cfg->port == 0)
+        return FALSE;
+    if (cfg->type != PROXY_TYPE_SOCKS5)
+        return FALSE;
+
+    // Prevent retry spam - only try every 1 second per config
+    ULONGLONG now = GetTickCount64();
+    if (now - cfg->last_udp_attempt < 1000)
+    {
+        log_message("[UDP ASSOC] Retry guard active for %s:%d, skipping", cfg->host, cfg->port);
+        return FALSE;
+    }
+
+    cfg->last_udp_attempt = now;
+
+    // Close existing connections if any
+    if (cfg->udp_tcp_ctrl != INVALID_SOCKET)
+    {
+        closesocket(cfg->udp_tcp_ctrl);
+        cfg->udp_tcp_ctrl = INVALID_SOCKET;
+    }
+    if (cfg->udp_send_sock != INVALID_SOCKET)
+    {
+        closesocket(cfg->udp_send_sock);
+        cfg->udp_send_sock = INVALID_SOCKET;
+    }
+
+    // Create TCP control connection
+    SOCKET tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_sock == INVALID_SOCKET)
+        return FALSE;
+
+    configure_tcp_socket(tcp_sock, 262144, 3000);
+
+    UINT32 socks5_ip = resolve_hostname(cfg->host);
+    if (socks5_ip == 0)
+    {
+        closesocket(tcp_sock);
+        return FALSE;
+    }
+
+    struct sockaddr_in socks_addr;
+    memset(&socks_addr, 0, sizeof(socks_addr));
+    socks_addr.sin_family = AF_INET;
+    socks_addr.sin_addr.s_addr = socks5_ip;
+    socks_addr.sin_port = htons(cfg->port);
+
+    // Bounded connect: a dead/unreachable proxy config fails in ~2s instead of stalling
+    // the single-threaded relay for the full OS SYN timeout (~21s), which was delaying
+    // real packets that use a *different*, working proxy config.
+    if (connect_with_timeout(tcp_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr), 2000) == SOCKET_ERROR)
+    {
+        closesocket(tcp_sock);
+        return FALSE;
+    }
+
+    if (socks5_udp_associate_with_config(tcp_sock, &cfg->udp_relay_addr, cfg) != 0)
+    {
+        closesocket(tcp_sock);
+        return FALSE;
+    }
+
+    // Many SOCKS5 servers return 0.0.0.0 as BND.ADDR in
+    // the UDP ASSOCIATE reply as per RFC 1928 says "use the same address
+    // as the TCP control connection".  sendto(0.0.0.0:PORT) fails with
+    // WSAEADDRNOTAVAIL (10049), so replace it with the proxy's resolved IP.
+    if (cfg->udp_relay_addr.sin_addr.s_addr == INADDR_ANY)
+        cfg->udp_relay_addr.sin_addr.s_addr = socks5_ip;
+
+    // haandshake completed remove the 3second timeout so the control socket stays open indefinitely
+    // keepalives below will detect actual disconnection.
+    DWORD zero_timeout = 0;
+    setsockopt(tcp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&zero_timeout, sizeof(zero_timeout));
+    setsockopt(tcp_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&zero_timeout, sizeof(zero_timeout));
+
+    // we can enable TCP keepalives so the SOCKS5 proxy dont idleclose the control
+    // connection (few proxies terminate it after 60 second of silence, killing UDP ASSOCIATE).
+    BOOL ka_on = TRUE;
+    setsockopt(tcp_sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&ka_on, sizeof(ka_on));
+    struct tcp_keepalive ka = { 1, 10000, 2000 }; // idle 10s, retry every 2s
+    DWORD ka_bytes;
+    WSAIoctl(tcp_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &ka_bytes, NULL, NULL);
+
+    cfg->udp_tcp_ctrl = tcp_sock;
+
+    // create UDP socket for sending to SOCKS5 proxy
+    cfg->udp_send_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (cfg->udp_send_sock == INVALID_SOCKET)
+    {
+        closesocket(cfg->udp_tcp_ctrl);
+        cfg->udp_tcp_ctrl = INVALID_SOCKET;
+        cfg->udp_connected = FALSE;
+        return FALSE;
+    }
+
+    configure_udp_socket(cfg->udp_send_sock, 262144, 30000);
+
+    cfg->udp_connected = TRUE;
+    log_message("UDP ASSOCIATE established with SOCKS5 proxy %s:%d (UDP relay at %s:%d)",
+        cfg->host, cfg->port,
+        inet_ntoa(cfg->udp_relay_addr.sin_addr), ntohs(cfg->udp_relay_addr.sin_port));
+    return TRUE;
+}
+
+static DWORD WINAPI udp_relay_server(LPVOID arg)
+{
+    WSADATA wsa_data;
+    struct sockaddr_in local_addr = {0}, from_addr = {0};
+    unsigned char recv_buf[MAXBUF];
+    unsigned char send_buf[MAXBUF];
+    int recv_len, from_len = 0;
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0)
+        return 1;
+
+    udp_relay_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udp_relay_socket == INVALID_SOCKET)
+    {
+        WSACleanup();
+        return 1;
+    }
+
+    int on = 1;
+    setsockopt(udp_relay_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+    configure_udp_socket(udp_relay_socket, 262144, 30000);
+
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);  // must be any WinDivert swaps src/dst IPs for
+    local_addr.sin_port = htons(LOCAL_UDP_RELAY_PORT);// tracked connections so packets arrive at the
+                                                      // machines real ip and not 127.0.0.1
+
+    if (bind(udp_relay_socket, (struct sockaddr *)&local_addr, sizeof(local_addr)) == SOCKET_ERROR)
+    {
+        closesocket(udp_relay_socket);
+        udp_relay_socket = INVALID_SOCKET;
+        WSACleanup();
+        return 1;
+    }
+
+    // IPv6 UDP relay socket on ::1:34011
+    udp_relay_socket6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (udp_relay_socket6 != INVALID_SOCKET)
+    {
+        int v6only = 1;
+        setsockopt(udp_relay_socket6, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6only, sizeof(v6only));
+        setsockopt(udp_relay_socket6, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+        configure_udp_socket(udp_relay_socket6, 262144, 30000);
+        struct sockaddr_in6 a6;
+        memset(&a6, 0, sizeof(a6));
+        a6.sin6_family = AF_INET6;
+        a6.sin6_addr = in6addr_any;   // same tracked packets arrive at machines real IPv6
+        a6.sin6_port = htons(LOCAL_UDP_RELAY_PORT);
+        if (bind(udp_relay_socket6, (struct sockaddr*)&a6, sizeof(a6)) == SOCKET_ERROR)
+        {
+            closesocket(udp_relay_socket6);
+            udp_relay_socket6 = INVALID_SOCKET;
+        }
+    }
+
+    // Try initial UDP ASSOCIATE only for SOCKS5 configs that an enabled rule actually uses.
+    // Skipping unreferenced configs avoids stalling the relay on dead/unused proxies.
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        if (g_proxy_configs[i].type == PROXY_TYPE_SOCKS5 &&
+            is_proxy_config_referenced(g_proxy_configs[i].config_id))
+        {
+            establish_udp_associate_for_config(&g_proxy_configs[i]);
+        }
+    }
+
+    log_message("UDP relay listening on port %d", LOCAL_UDP_RELAY_PORT);
+
+    while (running)
+    {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(udp_relay_socket, &read_fds);
+        if (udp_relay_socket6 != INVALID_SOCKET)
+            FD_SET(udp_relay_socket6, &read_fds);
+
+        // Add all SOCKS5 configs' TCP control and UDP send sockets
+        for (int i = 0; i < g_proxy_config_count; i++)
+        {
+            PROXY_CONFIG *cfg = &g_proxy_configs[i];
+            if (cfg->type != PROXY_TYPE_SOCKS5) continue;
+            if (cfg->udp_connected && cfg->udp_tcp_ctrl != INVALID_SOCKET)
+                FD_SET(cfg->udp_tcp_ctrl, &read_fds);
+            if (cfg->udp_connected && cfg->udp_send_sock != INVALID_SOCKET)
+                FD_SET(cfg->udp_send_sock, &read_fds);
+        }
+
+        struct timeval timeout = {1, 0};
+        if (select(0, &read_fds, NULL, NULL, &timeout) <= 0)
+        {
+            // Select timed out proactively reconnect any dropped UDP ASSOCIATEs so
+            // the connection is ready before the next client packet arrives.
+            // Real time communication need real time packet transfer, a single UDP Associate connction can take 1 to 2 seconds and it break the UDP steam for client app
+            // fuck you udp this cause slight increase in performance but needed for udp
+            for (int i = 0; i < g_proxy_config_count; i++)
+            {
+                PROXY_CONFIG *rc = &g_proxy_configs[i];
+                if (rc->type == PROXY_TYPE_SOCKS5 && !rc->udp_connected &&
+                    is_proxy_config_referenced(rc->config_id))
+                    establish_udp_associate_for_config(rc);
+            }
+            continue;
+        }
+
+        // Check if any SOCKS5 proxy TCP control socket disconnected
+        for (int i = 0; i < g_proxy_config_count; i++)
+        {
+            PROXY_CONFIG *cfg = &g_proxy_configs[i];
+            if (cfg->type != PROXY_TYPE_SOCKS5 || !cfg->udp_connected) continue;
+            if (cfg->udp_tcp_ctrl != INVALID_SOCKET && FD_ISSET(cfg->udp_tcp_ctrl, &read_fds))
+            {
+                char test_buf[1];
+                int result = recv(cfg->udp_tcp_ctrl, test_buf, sizeof(test_buf), MSG_PEEK);
+                if (result == 0 || (result == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK))
+                {
+                    log_message("[UDP RELAY] TCP control connection closed for proxy %s:%d - reconnecting", cfg->host, cfg->port);
+                    closesocket(cfg->udp_tcp_ctrl);
+                    cfg->udp_tcp_ctrl = INVALID_SOCKET;
+                    if (cfg->udp_send_sock != INVALID_SOCKET)
+                    {
+                        closesocket(cfg->udp_send_sock);
+                        cfg->udp_send_sock = INVALID_SOCKET;
+                    }
+                    cfg->udp_connected = FALSE;
+                    // Reconnect immediately so the next client packet is not dropped.
+                    establish_udp_associate_for_config(cfg);
+                }
+            }
+        }
+
+        // Check if packet is from local application
+        if (FD_ISSET(udp_relay_socket, &read_fds))
+        {
+            from_len = sizeof(from_addr);
+            recv_len = recvfrom(udp_relay_socket, (char*)recv_buf, sizeof(recv_buf), 0,
+                               (struct sockaddr *)&from_addr, &from_len);
+
+            if (recv_len == SOCKET_ERROR)
+            {
+                // take the error  unreachable so
+                // https://github.com/InterceptSuite/ProxyBridge/issues/89
+                // select() does not immediately return readable again, causing a spin.
+                continue;
+            }
+
+            if (recv_len > 0)
+            {
+                // Buffer overflow protection
+                if (recv_len > MAXBUF - 10) continue;
+
+                UINT16 from_port = ntohs(from_addr.sin_port);
+                UINT32 dest_ip;
+                UINT16 dest_port;
+
+                if (get_connection(from_port, &dest_ip, &dest_port))
+                {
+                    UINT32 proxy_config_id = get_connection_proxy_id(from_port);
+                    PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
+
+                    if (cfg == NULL || cfg->type != PROXY_TYPE_SOCKS5)
+                    {
+                        log_message("[UDP RELAY] No SOCKS5 config for port %d", from_port);
+                        continue;
+                    }
+
+                    // UDP ASSOCIATE is established (reconnect if dropped).
+                    // If reconnect succeeds, fall through and send the current packet
+                    // immediately so real-time streams lose at most one packet.
+                    if (!cfg->udp_connected)
+                    {
+                        if (!establish_udp_associate_for_config(cfg))
+                        {
+                            log_message("[UDP RELAY] UDP ASSOCIATE unavailable for %s:%d - dropping packet", cfg->host, cfg->port);
+                            continue;
+                        }
+                    }
+
+                    send_buf[0] = 0;
+                    send_buf[1] = 0;
+                    send_buf[2] = 0;
+                    send_buf[3] = SOCKS5_ATYP_IPV4;
+                    send_buf[4] = (dest_ip >> 0) & 0xFF;
+                    send_buf[5] = (dest_ip >> 8) & 0xFF;
+                    send_buf[6] = (dest_ip >> 16) & 0xFF;
+                    send_buf[7] = (dest_ip >> 24) & 0xFF;
+                    send_buf[8] = (dest_port >> 8) & 0xFF;
+                    send_buf[9] = (dest_port >> 0) & 0xFF;
+                    memcpy(&send_buf[10], recv_buf, recv_len);
+
+                    int sent = sendto(cfg->udp_send_sock, (char*)send_buf, 10 + recv_len, 0,
+                          (struct sockaddr *)&cfg->udp_relay_addr, sizeof(cfg->udp_relay_addr));
+
+                    if (sent == SOCKET_ERROR) {
+                        int err = WSAGetLastError();
+                        log_message("[UDP RELAY ERROR] sendto proxy %s:%d failed: %d - reconnecting and retrying", cfg->host, cfg->port, err);
+                        if (cfg->udp_tcp_ctrl != INVALID_SOCKET) { closesocket(cfg->udp_tcp_ctrl); cfg->udp_tcp_ctrl = INVALID_SOCKET; }
+                        if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); cfg->udp_send_sock = INVALID_SOCKET; }
+                        cfg->udp_connected = FALSE;
+                        // Reconnect and retry the current packet so real-time streams
+                        // lose at most one packet during a proxy reconnect event.
+                        if (establish_udp_associate_for_config(cfg))
+                        {
+                            sendto(cfg->udp_send_sock, (char*)send_buf, 10 + recv_len, 0,
+                                   (struct sockaddr *)&cfg->udp_relay_addr, sizeof(cfg->udp_relay_addr));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if packet is from any SOCKS5 proxy's UDP socket
+        for (int i = 0; i < g_proxy_config_count; i++)
+        {
+            PROXY_CONFIG *cfg = &g_proxy_configs[i];
+            if (cfg->type != PROXY_TYPE_SOCKS5 || !cfg->udp_connected) continue;
+            if (cfg->udp_send_sock == INVALID_SOCKET) continue;
+            // If not signalled by the outer select, do a zero-timeout check for
+            // sockets that were created this iteration (e.g. just after reconnect).
+            if (!FD_ISSET(cfg->udp_send_sock, &read_fds))
+            {
+                fd_set quick;
+                FD_ZERO(&quick);
+                FD_SET(cfg->udp_send_sock, &quick);
+                struct timeval zero_tv = {0, 0};
+                if (select(0, &quick, NULL, NULL, &zero_tv) <= 0 || !FD_ISSET(cfg->udp_send_sock, &quick))
+                    continue;
+            }
+
+            from_len = sizeof(from_addr);
+            recv_len = recvfrom(cfg->udp_send_sock, (char*)recv_buf, sizeof(recv_buf), 0,
+                               (struct sockaddr *)&from_addr, &from_len);
+
+            if (recv_len == SOCKET_ERROR)
+            {
+                int err = WSAGetLastError();
+                log_message("[UDP RELAY ERROR] Failed to receive from proxy %s:%d: %d - closing", cfg->host, cfg->port, err);
+                if (cfg->udp_tcp_ctrl != INVALID_SOCKET) { closesocket(cfg->udp_tcp_ctrl); cfg->udp_tcp_ctrl = INVALID_SOCKET; }
+                closesocket(cfg->udp_send_sock);
+                cfg->udp_send_sock = INVALID_SOCKET;
+                cfg->udp_connected = FALSE;
+                continue;
+            }
+
+            if (recv_len > 0)
+            {
+                // Packet from SOCKS5 proxy - decapsulate and forward to original sender
+                if (recv_len < 10) continue;
+
+                // SOCKS5 UDP: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR + DST.PORT(2) + DATA
+                if (recv_buf[2] != 0x00) continue;  // FRAG must be 0
+
+                if (recv_buf[3] == SOCKS5_ATYP_IPV4 && recv_len >= 10)
+                {
+                    UINT32 src_ip = (recv_buf[4]<<0)|(recv_buf[5]<<8)|(recv_buf[6]<<16)|(recv_buf[7]<<24);
+                    UINT16 src_port = (recv_buf[8]<<8)|recv_buf[9];
+
+                    BOOL found = FALSE;
+                    UINT32 target_ip = 0;
+                    UINT16 target_port = 0;
+                    CONNECTION_INFO *winner_conn = NULL;
+
+                    AcquireSRWLockShared(&lock);
+                    ULONGLONG best_activity = 0;
+                    for (int b = 0; b < CONNECTION_HASH_SIZE; b++)
+                    {
+                        CONNECTION_INFO *conn = connection_hash_table[b];
+                        while (conn != NULL)
+                        {
+                            if (!conn->is_ipv6 && conn->orig_dest_ip == src_ip && conn->orig_dest_port == src_port)
+                            {
+                                if (!found || conn->last_activity > best_activity)
+                                {
+                                    target_ip    = conn->src_ip;
+                                    target_port  = conn->src_port;
+                                    best_activity = conn->last_activity;
+                                    found        = TRUE;
+                                    winner_conn  = conn;
+                                    // Do NOT update last_activity here; doing so mid-loop
+                                    // corrupts best_activity comparisons for later entries,
+                                    // causing split delivery when multiple clients share the
+                                    // same destination. Update after the loop completes.
+                                }
+                            }
+                            conn = conn->next;
+                        }
+                    }
+                    // Keep winner's session alive (update outside loop so comparisons above
+                    // use the original, unmodified timestamps for all candidates).
+                    if (winner_conn != NULL)
+                        InterlockedExchange64((LONGLONG volatile*)&winner_conn->last_activity, (LONGLONG)GetTickCount64());
+                    ReleaseSRWLockShared(&lock);
+
+                    if (found)
+                    {
+                        struct sockaddr_in target_addr;
+                        memset(&target_addr, 0, sizeof(target_addr));
+                        target_addr.sin_family = AF_INET;
+                        target_addr.sin_addr.s_addr = target_ip;
+                        target_addr.sin_port = htons(target_port);
+                        int fwd = sendto(udp_relay_socket, (char*)&recv_buf[10], recv_len-10, 0,
+                               (struct sockaddr*)&target_addr, sizeof(target_addr));
+                        if (fwd == SOCKET_ERROR)
+                            log_message("[UDP RELAY] sendto client port %d failed: %d", target_port, WSAGetLastError());
+                    }
+                    else
+                    {
+                        log_message("[UDP RELAY] No session found for proxy response from %d.%d.%d.%d:%d - dropped",
+                            recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7], src_port);
+                    }
+                }
+                else if (recv_buf[3] == SOCKS5_ATYP_IPV6 && recv_len >= 22)
+                {
+                    UINT8 src_ip6[16];
+                    memcpy(src_ip6, &recv_buf[4], 16);
+                    UINT16 src_port = (recv_buf[20]<<8)|recv_buf[21];
+
+                    UINT8 target_ip6[16];
+                    UINT16 target_port = 0;
+                    if (find_v6_udp_sender(src_ip6, src_port, target_ip6, &target_port) && udp_relay_socket6 != INVALID_SOCKET)
+                    {
+                        struct sockaddr_in6 t6;
+                        memset(&t6, 0, sizeof(t6));
+                        t6.sin6_family = AF_INET6;
+                        memcpy(&t6.sin6_addr, target_ip6, 16);
+                        t6.sin6_port = htons(target_port);
+                        sendto(udp_relay_socket6, (char*)&recv_buf[22], recv_len-22, 0,
+                               (struct sockaddr*)&t6, sizeof(t6));
+                    }
+                }
+            }
+        }
+
+        // IPv6 UDP packets from application
+        if (udp_relay_socket6 != INVALID_SOCKET && FD_ISSET(udp_relay_socket6, &read_fds))
+        {
+            struct sockaddr_in6 from_addr6 = {0};
+            int fl = sizeof(from_addr6);
+            recv_len = recvfrom(udp_relay_socket6, (char*)recv_buf, sizeof(recv_buf), 0,
+                                (struct sockaddr*)&from_addr6, &fl);
+            if (recv_len > 0 && recv_len <= MAXBUF - 22)
+            {
+                UINT16 from_port = ntohs(from_addr6.sin6_port);
+                UINT8  dest_ip6[16];
+                UINT16 dest_port = 0;
+                UINT32 proxy_config_id = 0;
+
+                if (get_connection_full_v6(from_port, dest_ip6, &dest_port, &proxy_config_id))
+                {
+                    PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
+                    if (cfg != NULL && cfg->type == PROXY_TYPE_SOCKS5)
+                    {
+                        if (!cfg->udp_connected) establish_udp_associate_for_config(cfg);
+                        if (cfg->udp_connected)
+                        {
+                            send_buf[0] = 0; send_buf[1] = 0; send_buf[2] = 0;
+                            send_buf[3] = SOCKS5_ATYP_IPV6;
+                            memcpy(&send_buf[4], dest_ip6, 16);
+                            send_buf[20] = (dest_port>>8)&0xFF;
+                            send_buf[21] = (dest_port>>0)&0xFF;
+                            memcpy(&send_buf[22], recv_buf, recv_len);
+                            sendto(cfg->udp_send_sock, (char*)send_buf, 22+recv_len, 0,
+                                   (struct sockaddr*)&cfg->udp_relay_addr, sizeof(cfg->udp_relay_addr));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Clean up all proxy UDP sockets
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        PROXY_CONFIG *cfg = &g_proxy_configs[i];
+        if (cfg->udp_tcp_ctrl != INVALID_SOCKET) { closesocket(cfg->udp_tcp_ctrl); cfg->udp_tcp_ctrl = INVALID_SOCKET; }
+        if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); cfg->udp_send_sock = INVALID_SOCKET; }
+        cfg->udp_connected = FALSE;
+    }
+    closesocket(udp_relay_socket);
+    udp_relay_socket = INVALID_SOCKET;
+    if (udp_relay_socket6 != INVALID_SOCKET) { closesocket(udp_relay_socket6); udp_relay_socket6 = INVALID_SOCKET; }
+    WSACleanup();
+    return 0;
+}
+
+
+static DWORD WINAPI local_proxy_server(LPVOID arg)
+{
+    WSADATA wsa_data;
+    struct sockaddr_in addr;
+    SOCKET listen_sock;
+    int on = 1;
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0)
+    {
+        log_message("WSAStartup failed (%lu)", GetLastError());
+        return 1;
+    }
+
+    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_sock == INVALID_SOCKET)
+    {
+        log_message("Socket creation failed (%d)", WSAGetLastError());
+        WSACleanup();
+        return 1;
+    }
+
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+
+    int nodelay = 1;
+    setsockopt(listen_sock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);  // must be ANY: WinDivert swaps src/dst IPs for
+    addr.sin_port = htons(g_local_relay_port); // non-loopback traffic, so redirected SYNs arrive
+                                               // at the machine's real IP, not 127.0.0.1
+
+    if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
+    {
+        log_message("Bind failed (%d)", WSAGetLastError());
+        closesocket(listen_sock);
+        WSACleanup();
+        return 1;
+    }
+
+    if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR)
+    {
+        log_message("Listen failed (%d)", WSAGetLastError());
+        closesocket(listen_sock);
+        WSACleanup();
+        return 1;
+    }
+
+    // IPv6 loopback listener for redirected IPv6 TCP
+    SOCKET listen_sock6 = socket(AF_INET6, SOCK_STREAM, 0);
+    if (listen_sock6 != INVALID_SOCKET)
+    {
+        int v6only = 1;
+        setsockopt(listen_sock6, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6only, sizeof(v6only));
+        setsockopt(listen_sock6, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+        setsockopt(listen_sock6, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+        struct sockaddr_in6 addr6;
+        memset(&addr6, 0, sizeof(addr6));
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_addr = in6addr_any;   // same reason as IPv4: accept on any local address
+        addr6.sin6_port = htons(g_local_relay_port);
+        if (bind(listen_sock6, (struct sockaddr*)&addr6, sizeof(addr6)) == SOCKET_ERROR ||
+            listen(listen_sock6, SOMAXCONN) == SOCKET_ERROR)
+        {
+            log_message("IPv6 listen failed (%d)", WSAGetLastError());
+            closesocket(listen_sock6);
+            listen_sock6 = INVALID_SOCKET;
+        }
+        else
+        {
+            log_message("Local proxy IPv6 listening on [::]:%d", g_local_relay_port);
+        }
+    }
+
+    log_message("Local proxy listening on port %d", g_local_relay_port);
+
+    while (running)
+    {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(listen_sock, &read_fds);
+        if (listen_sock6 != INVALID_SOCKET)
+            FD_SET(listen_sock6, &read_fds);
+        struct timeval timeout = {1, 0};
+
+        if (select(0, &read_fds, NULL, NULL, &timeout) <= 0)
+            continue;
+
+        // helper lambda-like macro to accept and dispatch a connection
+        #define ACCEPT_AND_DISPATCH(sock, saddr_type, addr_field) do { \
+            saddr_type ca; int cl = sizeof(ca); \
+            SOCKET cs = accept(sock, (struct sockaddr*)&ca, &cl); \
+            if (cs == INVALID_SOCKET) break; \
+            CONNECTION_CONFIG *cc = (CONNECTION_CONFIG*)malloc(sizeof(CONNECTION_CONFIG)); \
+            if (cc == NULL) { closesocket(cs); break; } \
+            cc->client_socket = cs; \
+            UINT16 cp = ntohs(((saddr_type*)&ca)->addr_field); \
+            BOOL ok = cc->is_ipv6 ? \
+                get_connection_full_v6(cp, cc->orig_dest_ip6, &cc->orig_dest_port, &cc->proxy_config_id) : \
+                get_connection_full(cp, &cc->orig_dest_ip, &cc->orig_dest_port, &cc->proxy_config_id); \
+            if (!ok) { closesocket(cs); free(cc); break; } \
+            HANDLE t = CreateThread(NULL, 1, connection_handler, (LPVOID)cc, 0, NULL); \
+            if (t == NULL) { closesocket(cs); free(cc); break; } \
+            CloseHandle(t); \
+        } while(0)
+
+        if (FD_ISSET(listen_sock, &read_fds))
+        {
+            struct sockaddr_in client_addr;
+            int addr_len = sizeof(client_addr);
+            SOCKET client_sock = accept(listen_sock, (struct sockaddr *)&client_addr, &addr_len);
+
+            if (client_sock != INVALID_SOCKET)
+            {
+                CONNECTION_CONFIG *conn_config = (CONNECTION_CONFIG *)malloc(sizeof(CONNECTION_CONFIG));
+                if (conn_config != NULL)
+                {
+                    conn_config->client_socket = client_sock;
+                    conn_config->is_ipv6 = FALSE;
+
+                    UINT16 client_port = ntohs(client_addr.sin_port);
+                    if (get_connection_full(client_port, &conn_config->orig_dest_ip, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
+                    {
+                        HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
+                        if (conn_thread != NULL) { CloseHandle(conn_thread); }
+                        else { closesocket(client_sock); free(conn_config); }
+                    }
+                    else { closesocket(client_sock); free(conn_config); }
+                }
+                else { closesocket(client_sock); }
+            }
+        }
+
+        if (listen_sock6 != INVALID_SOCKET && FD_ISSET(listen_sock6, &read_fds))
+        {
+            struct sockaddr_in6 client_addr6;
+            int addr_len6 = sizeof(client_addr6);
+            SOCKET client_sock6 = accept(listen_sock6, (struct sockaddr*)&client_addr6, &addr_len6);
+
+            if (client_sock6 != INVALID_SOCKET)
+            {
+                CONNECTION_CONFIG *conn_config = (CONNECTION_CONFIG *)malloc(sizeof(CONNECTION_CONFIG));
+                if (conn_config != NULL)
+                {
+                    conn_config->client_socket = client_sock6;
+                    conn_config->is_ipv6 = TRUE;
+
+                    UINT16 client_port = ntohs(client_addr6.sin6_port);
+                    if (get_connection_full_v6(client_port, conn_config->orig_dest_ip6, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
+                    {
+                        HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
+                        if (conn_thread != NULL) { CloseHandle(conn_thread); }
+                        else { closesocket(client_sock6); free(conn_config); }
+                    }
+                    else { closesocket(client_sock6); free(conn_config); }
+                }
+                else { closesocket(client_sock6); }
+            }
+        }
+    }
+
+    #undef ACCEPT_AND_DISPATCH
+
+    closesocket(listen_sock);
+    if (listen_sock6 != INVALID_SOCKET) closesocket(listen_sock6);
+    WSACleanup();
+    return 0;
+}
+
+
+static DWORD WINAPI connection_handler(LPVOID arg)
+{
+    CONNECTION_CONFIG *config = (CONNECTION_CONFIG *)arg;
+    SOCKET client_sock = config->client_socket;
+    UINT32 dest_ip = config->orig_dest_ip;
+    UINT16 dest_port = config->orig_dest_port;
+    UINT32 proxy_config_id = config->proxy_config_id;
+    BOOL is_ipv6 = config->is_ipv6;
+    UINT8 dest_ip6[16];
+    if (is_ipv6) memcpy(dest_ip6, config->orig_dest_ip6, 16);
+    SOCKET socks_sock;
+    struct sockaddr_in socks_addr;
+
+    free(config);
+
+    // Look up the proxy config for this connection
+    PROXY_CONFIG *proxy = find_proxy_config(proxy_config_id);
+    if (proxy == NULL || proxy->host[0] == '\0' || proxy->port == 0)
+    {
+        log_message("[RELAY] No proxy config (id=%u) - dropping connection", proxy_config_id);
+        closesocket(client_sock);
+        return 1;
+    }
+
+    // Connect to proxy, use cached resolved IP to avoid DNS per connection
+    UINT32 proxy_ip = proxy->resolved_ip ? proxy->resolved_ip : resolve_hostname(proxy->host);
+    if (proxy_ip == 0)
+    {
+        closesocket(client_sock);
+        return 1;
+    }
+
+    socks_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (socks_sock == INVALID_SOCKET)
+    {
+        log_message("Socket creation failed (%d)", WSAGetLastError());
+        closesocket(client_sock);
+        return 0;
+    }
+
+    // 4 MB kernel socket buffers for the relay sockets.
+    // The upload path writes from client→proxy over a real network with non-zero
+    // RTT; a small (512 KB) send buffer causes send_all() to block the moment
+    // the proxy's receive window fills up, which stalls the relay loop and
+    // triggers TCP flow-control on the client side → massive upload throughput
+    // loss.  4 MB gives plenty of headroom even at high bitrates / high RTT.
+    configure_tcp_socket(socks_sock, 4194304, 30000);  // 4 MB – proxy connection
+    configure_tcp_socket(client_sock, 4194304, 30000); // 4 MB – app connection
+
+    memset(&socks_addr, 0, sizeof(socks_addr));
+    socks_addr.sin_family = AF_INET;
+    socks_addr.sin_addr.s_addr = proxy_ip;
+    socks_addr.sin_port = htons(proxy->port);
+
+    if (connect(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) == SOCKET_ERROR)
+    {
+        log_message("[RELAY] Failed to connect to proxy %s:%d (%d)", proxy->host, proxy->port, WSAGetLastError());
+        closesocket(client_sock);
+        closesocket(socks_sock);
+        return 0;
+    }
+
+    if (proxy->type == PROXY_TYPE_SOCKS5)
+    {
+        int rc;
+        char cached_domain[256];
+        if (is_ipv6)
+        {
+            if (dns_cache_lookup_v6(dest_ip6, cached_domain, sizeof(cached_domain)))
+                rc = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
+            else
+                rc = socks5_connect_v6(socks_sock, dest_ip6, dest_port, proxy);
+        }
+        else
+        {
+            if (dns_cache_lookup(dest_ip, cached_domain, sizeof(cached_domain)))
+                rc = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
+            else
+                rc = socks5_connect(socks_sock, dest_ip, dest_port, proxy);
+        }
+        if (rc != 0)
+        {
+            closesocket(client_sock);
+            closesocket(socks_sock);
+            return 0;
+        }
+    }
+    else if (proxy->type == PROXY_TYPE_HTTP)
+    {
+        int rc = is_ipv6
+            ? http_connect_v6(socks_sock, dest_ip6, dest_port, proxy)
+            : http_connect(socks_sock, dest_ip, dest_port, proxy);
+        if (rc != 0)
+        {
+            closesocket(client_sock);
+            closesocket(socks_sock);
+            return 0;
+        }
+    }
+
+    // Disable timeout for data transfer phase
+    DWORD zero_timeout = 0;
+    setsockopt(socks_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&zero_timeout, sizeof(zero_timeout));
+    setsockopt(socks_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&zero_timeout, sizeof(zero_timeout));
+    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&zero_timeout, sizeof(zero_timeout));
+    setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&zero_timeout, sizeof(zero_timeout));
+
+    // Enable and configure customized TCP keep-alives
+    struct tcp_keepalive keepalive_settings;
+    keepalive_settings.onoff = 1;
+    keepalive_settings.keepalivetime = 300000;      // 5 minutes in milliseconds
+    keepalive_settings.keepaliveinterval = 1000;    // 1 second interval
+    DWORD bytes_returned = 0;
+    WSAIoctl(socks_sock, SIO_KEEPALIVE_VALS, &keepalive_settings, sizeof(keepalive_settings), NULL, 0, &bytes_returned, NULL, NULL);
+    WSAIoctl(client_sock, SIO_KEEPALIVE_VALS, &keepalive_settings, sizeof(keepalive_settings), NULL, 0, &bytes_returned, NULL, NULL);
+
+    TRANSFER_CONFIG *transfer_config = (TRANSFER_CONFIG *)malloc(sizeof(TRANSFER_CONFIG));
+
+    if (transfer_config == NULL)
+    {
+        log_message("Memory allocation failed for transfer_config");
+        closesocket(client_sock);
+        closesocket(socks_sock);
+        return 0;
+    }
+
+    transfer_config->from_socket = client_sock;
+    transfer_config->to_socket = socks_sock;
+
+    // both transfer in current thread
+    transfer_handler((LPVOID)transfer_config);
+
+    // Sockets already closed in transfer_handler!
+
+    return 0;
+}
+
+// One-directional relay: reads from `from` and writes to `to`.
+// Runs as a dedicated thread so upload and download never block each other.
+// Uses a shared RELAY_PAIR reference count for safe socket cleanup:
+//   - whichever direction finishes first calls shutdown() on both sockets,
+//     which causes the sibling thread's recv() to return 0 and exit cleanly.
+//   - the last thread to exit (refs drops to 0) closes both sockets and
+//     frees the shared RELAY_PAIR.
+static DWORD WINAPI one_way_relay(LPVOID arg)
+{
+    ONE_WAY_CONFIG *cfg = (ONE_WAY_CONFIG *)arg;
+    RELAY_PAIR *pair = cfg->pair;
+    SOCKET from = cfg->from;
+    SOCKET to   = cfg->to;
+    free(cfg);
+
+    char *buf = (char *)malloc(131072);  // 128 KB per-direction buffer
+    if (buf)
+    {
+        int len;
+        while ((len = recv(from, buf, 131072, 0)) > 0)
+        {
+            if (send_all(to, buf, len) == SOCKET_ERROR)
+                break;
+        }
+        free(buf);
+    }
+
+    // Signal the sibling relay to stop by shutting down both sockets.
+    // shutdown() is safe to call from any thread; it just drains/resets the
+    // socket without closing the handle, so the other thread's recv() returns 0.
+    shutdown(pair->sock_client, SD_BOTH);
+    shutdown(pair->sock_proxy,  SD_BOTH);
+
+    // Last thread out closes and frees everything.
+    if (InterlockedDecrement(&pair->refs) == 0)
+    {
+        closesocket(pair->sock_client);
+        closesocket(pair->sock_proxy);
+        free(pair);
+    }
+
+    return 0;
+}
+
+// Bidirectional relay: spawns one thread for upload (client→proxy) and runs
+// the download (proxy→client) direction in the calling thread.  Blocks until
+// both directions have finished so the caller (connection_handler) can return
+// cleanly and its thread handle can be closed.
+static DWORD WINAPI transfer_handler(LPVOID arg)
+{
+    TRANSFER_CONFIG *config = (TRANSFER_CONFIG *)arg;
+    SOCKET sock_client = config->from_socket;
+    SOCKET sock_proxy  = config->to_socket;
+    free(config);
+
+    RELAY_PAIR *pair = (RELAY_PAIR *)malloc(sizeof(RELAY_PAIR));
+    if (!pair)
+    {
+        closesocket(sock_client);
+        closesocket(sock_proxy);
+        return 1;
+    }
+    pair->sock_client = sock_client;
+    pair->sock_proxy  = sock_proxy;
+    pair->refs        = 2;
+
+    // Upload: client → proxy  (dedicated thread - may block on slow proxy send)
+    ONE_WAY_CONFIG *up = (ONE_WAY_CONFIG *)malloc(sizeof(ONE_WAY_CONFIG));
+    // Download: proxy → client (runs in this thread - loopback, rarely blocks)
+    ONE_WAY_CONFIG *dn = (ONE_WAY_CONFIG *)malloc(sizeof(ONE_WAY_CONFIG));
+
+    if (!up || !dn)
+    {
+        free(up);
+        free(dn);
+        free(pair);
+        closesocket(sock_client);
+        closesocket(sock_proxy);
+        return 1;
+    }
+
+    up->pair = pair;  up->from = sock_client;  up->to = sock_proxy;
+    dn->pair = pair;  dn->from = sock_proxy;   dn->to = sock_client;
+
+    // Spawn the upload relay in its own thread.
+    HANDLE upload_thread = CreateThread(NULL, 0, one_way_relay, up, 0, NULL);
+    if (!upload_thread)
+    {
+        free(up);
+        free(dn);
+        free(pair);
+        closesocket(sock_client);
+        closesocket(sock_proxy);
+        return 1;
+    }
+
+    // Run the download relay in this thread (blocks until done).
+    one_way_relay(dn);
+
+    // Wait for the upload relay thread to finish, then clean up its handle.
+    WaitForSingleObject(upload_thread, INFINITE);
+    CloseHandle(upload_thread);
+
+    return 0;
+}
+
+static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id)
+{
+    AcquireSRWLockExclusive(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *existing = connection_hash_table[hash];
+
+    // check if already exists in this hash bucket
+    while (existing != NULL) {
+        if (existing->src_port == src_port) {
+            existing->is_ipv6 = FALSE;
+            existing->src_ip = src_ip;
+            existing->orig_dest_ip = dest_ip;
+            existing->orig_dest_port = dest_port;
+            existing->proxy_config_id = proxy_config_id;
+            existing->is_tracked = TRUE;
+            existing->last_activity = GetTickCount64();
+            ReleaseSRWLockExclusive(&lock);
+            return;
+        }
+        existing = existing->next;
+    }
+
+    CONNECTION_INFO *conn = (CONNECTION_INFO *)calloc(1, sizeof(CONNECTION_INFO));
+    if (conn == NULL) {
+        ReleaseSRWLockExclusive(&lock);
+        return;
+    }
+
+    conn->src_port = src_port;
+    conn->src_ip = src_ip;
+    conn->orig_dest_ip = dest_ip;
+    conn->orig_dest_port = dest_port;
+    conn->proxy_config_id = proxy_config_id;
+    conn->is_tracked = TRUE;
+    conn->is_ipv6 = FALSE;
+    conn->last_activity = GetTickCount64();
+
+    conn->next = connection_hash_table[hash];
+    connection_hash_table[hash] = conn;
+    ReleaseSRWLockExclusive(&lock);
+}
+
+static void add_connection_v6(UINT16 src_port, const UINT8 src_ip6[16], const UINT8 dest_ip6[16], UINT16 dest_port, UINT32 proxy_config_id)
+{
+    AcquireSRWLockExclusive(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *existing = connection_hash_table[hash];
+
+    while (existing != NULL) {
+        if (existing->src_port == src_port) {
+            existing->is_ipv6 = TRUE;
+            memcpy(existing->src_ip6, src_ip6, 16);
+            memcpy(existing->orig_dest_ip6, dest_ip6, 16);
+            existing->orig_dest_port = dest_port;
+            existing->proxy_config_id = proxy_config_id;
+            existing->is_tracked = TRUE;
+            existing->last_activity = GetTickCount64();
+            ReleaseSRWLockExclusive(&lock);
+            return;
+        }
+        existing = existing->next;
+    }
+
+    CONNECTION_INFO *conn = (CONNECTION_INFO *)malloc(sizeof(CONNECTION_INFO));
+    if (conn == NULL) {
+        ReleaseSRWLockExclusive(&lock);
+        return;
+    }
+
+    conn->src_port = src_port;
+    conn->src_ip = 0;
+    conn->orig_dest_ip = 0;
+    conn->is_ipv6 = TRUE;
+    memcpy(conn->src_ip6, src_ip6, 16);
+    memcpy(conn->orig_dest_ip6, dest_ip6, 16);
+    conn->orig_dest_port = dest_port;
+    conn->proxy_config_id = proxy_config_id;
+    conn->is_tracked = TRUE;
+    conn->last_activity = GetTickCount64();
+    conn->next = connection_hash_table[hash];
+    connection_hash_table[hash] = conn;
+    ReleaseSRWLockExclusive(&lock);
+}
+
+static BOOL get_connection_full_v6(UINT16 src_port, UINT8 dest_ip6[16], UINT16 *dest_port, UINT32 *proxy_config_id)
+{
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&lock);
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *conn = connection_hash_table[hash];
+    while (conn != NULL) {
+        if (conn->src_port == src_port && conn->is_ipv6) {
+            memcpy(dest_ip6, conn->orig_dest_ip6, 16);
+            *dest_port = conn->orig_dest_port;
+            if (proxy_config_id != NULL) *proxy_config_id = conn->proxy_config_id;
+            InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
+            found = TRUE;
+            break;
+        }
+        conn = conn->next;
+    }
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
+// Reverse lookup for IPv6 UDP relay responses: find src addr+port by orig dest ip6+port
+static BOOL find_v6_udp_sender(const UINT8 orig_dest_ip6[16], UINT16 orig_dest_port, UINT8 src_ip6[16], UINT16 *src_port)
+{
+    BOOL found = FALSE;
+    ULONGLONG best = 0;
+    AcquireSRWLockShared(&lock);
+    for (int b = 0; b < CONNECTION_HASH_SIZE; b++) {
+        CONNECTION_INFO *conn = connection_hash_table[b];
+        while (conn != NULL) {
+            if (conn->is_ipv6 && conn->orig_dest_port == orig_dest_port &&
+                memcmp(conn->orig_dest_ip6, orig_dest_ip6, 16) == 0) {
+                if (!found || conn->last_activity > best) {
+                    memcpy(src_ip6, conn->src_ip6, 16);
+                    *src_port = conn->src_port;
+                    best = conn->last_activity;
+                    found = TRUE;
+                }
+            }
+            conn = conn->next;
+        }
+    }
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
+static BOOL is_connection_tracked(UINT16 src_port)
+{
+    BOOL tracked = FALSE;
+    AcquireSRWLockShared(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *conn = connection_hash_table[hash];
+
+    while (conn != NULL) {
+        if (conn->src_port == src_port && conn->is_tracked) {
+            tracked = TRUE;
+            break;
+        }
+        conn = conn->next;
+    }
+    ReleaseSRWLockShared(&lock);
+    return tracked;
+}
+
+static BOOL get_connection(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port)
+{
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *conn = connection_hash_table[hash];
+
+    while (conn != NULL)
+    {
+        if (conn->src_port == src_port)
+        {
+            *dest_ip = conn->orig_dest_ip;
+            *dest_port = conn->orig_dest_port;
+            InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
+            found = TRUE;
+            break;
+        }
+        conn = conn->next;
+    }
+    ReleaseSRWLockShared(&lock);
+
+    return found;
+}
+
+static BOOL get_connection_full(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port, UINT32 *proxy_config_id)
+{
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *conn = connection_hash_table[hash];
+
+    while (conn != NULL)
+    {
+        if (conn->src_port == src_port)
+        {
+            *dest_ip = conn->orig_dest_ip;
+            *dest_port = conn->orig_dest_port;
+            if (proxy_config_id != NULL) *proxy_config_id = conn->proxy_config_id;
+            InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
+            found = TRUE;
+            break;
+        }
+        conn = conn->next;
+    }
+    ReleaseSRWLockShared(&lock);
+
+    return found;
+}
+
+static UINT32 get_connection_proxy_id(UINT16 src_port)
+{
+    UINT32 proxy_config_id = 0;
+
+    AcquireSRWLockShared(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *conn = connection_hash_table[hash];
+
+    while (conn != NULL)
+    {
+        if (conn->src_port == src_port)
+        {
+            proxy_config_id = conn->proxy_config_id;
+            break;
+        }
+        conn = conn->next;
+    }
+    ReleaseSRWLockShared(&lock);
+
+    return proxy_config_id;
+}
+
+static void remove_connection(UINT16 src_port)
+{
+    AcquireSRWLockExclusive(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO **conn_ptr = &connection_hash_table[hash];
+
+    while (*conn_ptr != NULL)
+    {
+        if ((*conn_ptr)->src_port == src_port)
+        {
+            CONNECTION_INFO *to_free = *conn_ptr;
+            *conn_ptr = (*conn_ptr)->next;
+            free(to_free);
+            break;
+        }
+        conn_ptr = &(*conn_ptr)->next;
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+static void cleanup_stale_connections(void)
+{
+    ULONGLONG now = GetTickCount64();
+
+    for (int i = 0; i < CONNECTION_HASH_SIZE; i++)
+    {
+        AcquireSRWLockExclusive(&lock);
+        CONNECTION_INFO **conn_ptr = &connection_hash_table[i];
+
+        while (*conn_ptr != NULL)
+        {
+            if (now - (*conn_ptr)->last_activity > 120000)
+            {
+                CONNECTION_INFO *to_free = *conn_ptr;
+                *conn_ptr = (*conn_ptr)->next;
+                ReleaseSRWLockExclusive(&lock);
+                free(to_free);
+                AcquireSRWLockExclusive(&lock);
+            }
+            else
+            {
+                conn_ptr = &(*conn_ptr)->next;
+            }
+        }
+        ReleaseSRWLockExclusive(&lock);
+    }
+
+    ULONGLONG now_cache = GetTickCount64();
+    for (int i = 0; i < PID_CACHE_SIZE; i++)
+    {
+        AcquireSRWLockExclusive(&lock);
+        PID_CACHE_ENTRY **entry_ptr = &pid_cache[i];
+        while (*entry_ptr != NULL)
+        {
+            if (now_cache - (*entry_ptr)->timestamp > 10000)
+            {
+                PID_CACHE_ENTRY *to_free = *entry_ptr;
+                *entry_ptr = (*entry_ptr)->next;
+                ReleaseSRWLockExclusive(&lock);
+                free(to_free);
+                AcquireSRWLockExclusive(&lock);
+            }
+            else
+            {
+                entry_ptr = &(*entry_ptr)->next;
+            }
+        }
+        ReleaseSRWLockExclusive(&lock);
+    }
+
+    AcquireSRWLockExclusive(&lock);
+    int logged_count = 0;
+    LOGGED_CONNECTION *temp = logged_connections;
+    while (temp != NULL) { logged_count++; temp = temp->next; }
+
+    if (logged_count > 100)
+    {
+        temp = logged_connections;
+        for (int i = 0; i < 99 && temp != NULL; i++)
+            temp = temp->next;
+
+        if (temp != NULL)
+        {
+            LOGGED_CONNECTION *to_free_list = temp->next;
+            temp->next = NULL;
+            while (to_free_list != NULL)
+            {
+                LOGGED_CONNECTION *next = to_free_list->next;
+                free(to_free_list);
+                to_free_list = next;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+PROXYBRIDGE_API UINT32 ProxyBridge_AddRule(const char* process_name, const char* target_hosts, const char* target_ports, const char* target_domains, RuleProtocol protocol, RuleAction action, UINT32 proxy_config_id)
+{
+    if (process_name == NULL || process_name[0] == '\0')
+        return 0;
+
+    PROCESS_RULE *rule = (PROCESS_RULE *)malloc(sizeof(PROCESS_RULE));
+    if (rule == NULL)
+        return 0;
+
+    rule->rule_id = g_next_rule_id++;
+    strncpy_s(rule->process_name, MAX_PROCESS_NAME, process_name, _TRUNCATE);
+    rule->protocol = protocol;
+    rule->proxy_config_id = proxy_config_id;
+    rule->dns_resolution_count = 0; // Extended ProxyBridge: no DNS policy by default = no interception, unchanged behaviour
+    rule->target_hosts = NULL;
+    rule->target_ports = NULL;
+    rule->target_domains = NULL;
+
+    if (target_hosts != NULL && target_hosts[0] != '\0')
+    {
+        size_t len = strnlen_s(target_hosts, MAX_LIST_SIZE) + 1;
+        rule->target_hosts = (char *)malloc(len);
+        if (rule->target_hosts == NULL)
+        {
+            free(rule);
+            return 0;
+        }
+        strncpy_s(rule->target_hosts, len, target_hosts, _TRUNCATE);
+    }
+    else
+    {
+        // Default to "*" ll IPs
+        rule->target_hosts = (char *)malloc(2);
+        if (rule->target_hosts == NULL)
+        {
+            free(rule);
+            return 0;
+        }
+        strcpy_s(rule->target_hosts, 2, "*");
+    }
+
+    // Dynamically allocate memory for target_ports no size limit!
+    if (target_ports != NULL && target_ports[0] != '\0')
+    {
+        size_t len = strnlen_s(target_ports, MAX_LIST_SIZE) + 1;
+        rule->target_ports = (char *)malloc(len);
+        if (rule->target_ports == NULL)
+        {
+            free(rule->target_hosts);
+            free(rule);
+            return 0;
+        }
+        strncpy_s(rule->target_ports, len, target_ports, _TRUNCATE);
+    }
+    else
+    {
+        // Default to "*" - all ports
+        rule->target_ports = (char *)malloc(2);
+        if (rule->target_ports == NULL)
+        {
+            free(rule->target_hosts);
+            free(rule);
+            return 0;
+        }
+        strcpy_s(rule->target_ports, 2, "*");
+    }
+
+    // target_domains: "" or NULL means no domain restriction (stored as "*")
+    if (target_domains != NULL && target_domains[0] != '\0')
+    {
+        size_t len = strnlen_s(target_domains, MAX_LIST_SIZE) + 1;
+        rule->target_domains = (char *)malloc(len);
+        if (rule->target_domains == NULL)
+        {
+            free(rule->target_ports);
+            free(rule->target_hosts);
+            free(rule);
+            return 0;
+        }
+        strncpy_s(rule->target_domains, len, target_domains, _TRUNCATE);
+    }
+    else
+    {
+        rule->target_domains = (char *)malloc(2);
+        if (rule->target_domains == NULL)
+        {
+            free(rule->target_ports);
+            free(rule->target_hosts);
+            free(rule);
+            return 0;
+        }
+        strcpy_s(rule->target_domains, 2, "*");
+    }
+
+    rule->action = action;
+    rule->enabled = TRUE;
+    rule->next = NULL;
+
+    // Append to tail so rules are evaluated in the order they were added,
+    // matching the visual top-to-bottom order in the GUI (fixes issue #93).
+    AcquireSRWLockExclusive(&g_rules_lock);
+    if (rules_list == NULL)
+    {
+        rules_list = rule;
+    }
+    else
+    {
+        PROCESS_RULE *tail = rules_list;
+        while (tail->next != NULL)
+            tail = tail->next;
+        tail->next = rule;
+    }
+    UINT32 new_id = rule->rule_id;
+    ReleaseSRWLockExclusive(&g_rules_lock);
+
+    update_has_active_rules();
+    log_message("Added rule ID: %u for process '%s' (Protocol: %d, Action: %d, ProxyConfigId: %u, Domains: %s)", new_id, process_name, protocol, action, proxy_config_id, target_domains ? target_domains : "*");
+
+    return new_id;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_EnableRule(UINT32 rule_id)
+{
+    if (rule_id == 0)
+        return FALSE;
+
+    BOOL found = FALSE;
+    AcquireSRWLockExclusive(&g_rules_lock);
+    PROCESS_RULE *rule = rules_list;
+    while (rule != NULL)
+    {
+        if (rule->rule_id == rule_id)
+        {
+            rule->enabled = TRUE;
+            found = TRUE;
+            break;
+        }
+        rule = rule->next;
+    }
+    ReleaseSRWLockExclusive(&g_rules_lock);
+
+    if (found)
+    {
+        update_has_active_rules();
+        log_message("Enabled rule ID: %u", rule_id);
+    }
+    return found;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_DisableRule(UINT32 rule_id)
+{
+    if (rule_id == 0)
+        return FALSE;
+
+    BOOL found = FALSE;
+    AcquireSRWLockExclusive(&g_rules_lock);
+    PROCESS_RULE *rule = rules_list;
+    while (rule != NULL)
+    {
+        if (rule->rule_id == rule_id)
+        {
+            rule->enabled = FALSE;
+            found = TRUE;
+            break;
+        }
+        rule = rule->next;
+    }
+    ReleaseSRWLockExclusive(&g_rules_lock);
+
+    if (found)
+    {
+        update_has_active_rules();  // Phase 1: Update fast-path flag
+        log_message("Disabled rule ID: %u", rule_id);
+    }
+    return found;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_DeleteRule(UINT32 rule_id)
+{
+    if (rule_id == 0)
+        return FALSE;
+
+    BOOL found = FALSE;
+    AcquireSRWLockExclusive(&g_rules_lock);
+    PROCESS_RULE *rule = rules_list;
+    PROCESS_RULE *prev = NULL;
+
+    while (rule != NULL)
+    {
+        if (rule->rule_id == rule_id)
+        {
+            if (prev == NULL)
+                rules_list = rule->next;
+            else
+                prev->next = rule->next;
+
+            // Unlink + free under the exclusive lock so no reader can be mid-traversal
+            // on this node (readers hold the shared lock; exclusive waits them out).
+            if (rule->target_hosts != NULL)
+                free(rule->target_hosts);
+            if (rule->target_ports != NULL)
+                free(rule->target_ports);
+            if (rule->target_domains != NULL)
+                free(rule->target_domains);
+            free(rule);
+            found = TRUE;
+            break;
+        }
+        prev = rule;
+        rule = rule->next;
+    }
+    ReleaseSRWLockExclusive(&g_rules_lock);
+
+    if (found)
+    {
+        update_has_active_rules();
+        log_message("Deleted rule ID: %u", rule_id);
+    }
+    return found;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_EditRule(UINT32 rule_id, const char* process_name, const char* target_hosts, const char* target_ports, const char* target_domains, RuleProtocol protocol, RuleAction action, UINT32 proxy_config_id)
+{
+    if (rule_id == 0 || process_name == NULL || target_hosts == NULL || target_ports == NULL)
+        return FALSE;
+
+    // NULL/"" domains means "no restriction" -> stored as "*"
+    const char *domains_in = (target_domains != NULL && target_domains[0] != '\0') ? target_domains : "*";
+
+    // Allocate the three replacements up front (outside the lock) so a failure leaves the
+    // rule untouched and the lock is held only for the pointer swap.
+    char *new_hosts   = _strdup(target_hosts);
+    char *new_ports   = _strdup(target_ports);
+    char *new_domains = _strdup(domains_in);
+    if (new_hosts == NULL || new_ports == NULL || new_domains == NULL)
+    {
+        free(new_hosts);
+        free(new_ports);
+        free(new_domains);
+        return FALSE;
+    }
+
+    BOOL found = FALSE;
+    AcquireSRWLockExclusive(&g_rules_lock);
+    PROCESS_RULE *rule = rules_list;
+    while (rule != NULL)
+    {
+        if (rule->rule_id == rule_id)
+        {
+            strncpy_s(rule->process_name, MAX_PROCESS_NAME, process_name, _TRUNCATE);
+
+            free(rule->target_hosts);
+            free(rule->target_ports);
+            free(rule->target_domains);
+            rule->target_hosts   = new_hosts;
+            rule->target_ports   = new_ports;
+            rule->target_domains = new_domains;
+
+            rule->protocol = protocol;
+            rule->action = action;
+            rule->proxy_config_id = proxy_config_id;
+            found = TRUE;
+            break;
+        }
+        rule = rule->next;
+    }
+    ReleaseSRWLockExclusive(&g_rules_lock);
+
+    if (!found)
+    {
+        // rule_id not found - the pre-allocated strings were never installed, free them.
+        free(new_hosts);
+        free(new_ports);
+        free(new_domains);
+        return FALSE;
+    }
+
+    update_has_active_rules();
+    log_message("Updated rule ID: %u (ProxyConfigId: %u, Domains: %s)", rule_id, proxy_config_id, domains_in);
+    return TRUE;
+}
+
+PROXYBRIDGE_API UINT32 ProxyBridge_GetRulePosition(UINT32 rule_id)
+{
+    if (rule_id == 0)
+        return 0;
+
+    UINT32 position = 1;
+    UINT32 result = 0;
+    AcquireSRWLockShared(&g_rules_lock);
+    PROCESS_RULE *rule = rules_list;
+    while (rule != NULL)
+    {
+        if (rule->rule_id == rule_id)
+        {
+            result = position;
+            break;
+        }
+        position++;
+        rule = rule->next;
+    }
+    ReleaseSRWLockShared(&g_rules_lock);
+    return result;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_MoveRuleToPosition(UINT32 rule_id, UINT32 new_position)
+{
+    if (rule_id == 0 || new_position == 0)
+        return FALSE;
+
+    // Relink under the exclusive lock so packet-path readers never see a half-moved list.
+    AcquireSRWLockExclusive(&g_rules_lock);
+
+    // first rule and remove it from current position
+    PROCESS_RULE *rule = rules_list;
+    PROCESS_RULE *prev = NULL;
+
+    while (rule != NULL)
+    {
+        if (rule->rule_id == rule_id)
+            break;
+        prev = rule;
+        rule = rule->next;
+    }
+
+    if (rule == NULL)
+    {
+        ReleaseSRWLockExclusive(&g_rules_lock);
+        return FALSE;
+    }
+
+    // Remove from current position
+    if (prev == NULL)
+    {
+        rules_list = rule->next;
+    }
+    else
+    {
+        prev->next = rule->next;
+    }
+
+    // Insert at new position
+    if (new_position == 1)
+    {
+        // Insert at head
+        rule->next = rules_list;
+        rules_list = rule;
+    }
+    else
+    {
+        // taken from stackflow
+        PROCESS_RULE *current = rules_list;
+        UINT32 pos = 1;
+
+        while (current != NULL && pos < new_position - 1)
+        {
+            current = current->next;
+            pos++;
+        }
+
+        if (current == NULL)
+        {
+            // position is beyond list end we can append to tail
+            current = rules_list;
+            while (current->next != NULL)
+                current = current->next;
+            current->next = rule;
+            rule->next = NULL;
+        }
+        else
+        {
+            rule->next = current->next;
+            current->next = rule;
+        }
+    }
+
+    ReleaseSRWLockExclusive(&g_rules_lock);
+
+    log_message("Moved rule ID %u to position %u", rule_id, new_position);
+    return TRUE;
+}
+
+PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* proxy_ip, UINT16 proxy_port, const char* username, const char* password)
+{
+    if (proxy_ip == NULL || proxy_ip[0] == '\0' || proxy_port == 0)
+        return 0;
+
+    if (resolve_hostname(proxy_ip) == 0)
+        return 0;
+
+    if (g_proxy_config_count >= MAX_PROXY_CONFIGS)
+        return 0;
+
+    PROXY_CONFIG *cfg = &g_proxy_configs[g_proxy_config_count];
+    memset(cfg, 0, sizeof(PROXY_CONFIG));
+
+    cfg->config_id = g_next_config_id++;
+    cfg->type      = (type == PROXY_TYPE_HTTP) ? PROXY_TYPE_HTTP : PROXY_TYPE_SOCKS5;
+    cfg->port      = proxy_port;
+    strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
+    cfg->resolved_ip = resolve_hostname(proxy_ip);
+    if (username != NULL) strncpy_s(cfg->username, sizeof(cfg->username), username, _TRUNCATE);
+    if (password != NULL) strncpy_s(cfg->password, sizeof(cfg->password), password, _TRUNCATE);
+    cfg->udp_tcp_ctrl  = INVALID_SOCKET;
+    cfg->udp_send_sock = INVALID_SOCKET;
+    cfg->udp_connected = FALSE;
+    cfg->fallback_config_id = 0;
+    cfg->is_healthy = 1; // assume healthy until the first check says otherwise
+
+    g_proxy_config_count++;
+    log_message("Added proxy config ID %u: %s:%u (type %d)", cfg->config_id, cfg->host, cfg->port, cfg->type);
+    return cfg->config_id;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_EditProxyConfig(UINT32 config_id, ProxyType type, const char* proxy_ip, UINT16 proxy_port, const char* username, const char* password)
+{
+    if (proxy_ip == NULL || proxy_ip[0] == '\0' || proxy_port == 0)
+        return FALSE;
+
+    UINT32 resolved = resolve_hostname(proxy_ip);
+    if (resolved == 0)
+        return FALSE;
+
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        PROXY_CONFIG *cfg = &g_proxy_configs[i];
+        if (cfg->config_id == config_id)
+        {
+            // Close any open UDP state before changing config
+            if (cfg->udp_tcp_ctrl != INVALID_SOCKET)  { closesocket(cfg->udp_tcp_ctrl);  cfg->udp_tcp_ctrl  = INVALID_SOCKET; }
+            if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); cfg->udp_send_sock = INVALID_SOCKET; }
+            cfg->udp_connected = FALSE;
+
+            cfg->type = (type == PROXY_TYPE_HTTP) ? PROXY_TYPE_HTTP : PROXY_TYPE_SOCKS5;
+            cfg->port = proxy_port;
+            strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
+            cfg->resolved_ip = resolved;
+            cfg->username[0] = '\0';
+            cfg->password[0] = '\0';
+            if (username != NULL) strncpy_s(cfg->username, sizeof(cfg->username), username, _TRUNCATE);
+            if (password != NULL) strncpy_s(cfg->password, sizeof(cfg->password), password, _TRUNCATE);
+
+            log_message("Edited proxy config ID %u: %s:%u (type %d)", config_id, cfg->host, cfg->port, cfg->type);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_DeleteProxyConfig(UINT32 config_id)
+{
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        PROXY_CONFIG *cfg = &g_proxy_configs[i];
+        if (cfg->config_id == config_id)
+        {
+            if (cfg->udp_tcp_ctrl != INVALID_SOCKET)  { closesocket(cfg->udp_tcp_ctrl);  }
+            if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); }
+
+            // Shift remaining entries down
+            int remaining = g_proxy_config_count - i - 1;
+            if (remaining > 0)
+                memmove(&g_proxy_configs[i], &g_proxy_configs[i + 1], remaining * sizeof(PROXY_CONFIG));
+
+            g_proxy_config_count--;
+            log_message("Deleted proxy config ID %u", config_id);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// ── Failover API (Extended ProxyBridge) ─────────────────────────────────────
+
+// Links config_id -> fallback_config_id as the next choice to try when config_id
+// is unhealthy. Call repeatedly to build a longer chain, e.g.:
+//   ProxyBridge_SetProxyFallback(1, 2);  // if 1 is down, try 2
+//   ProxyBridge_SetProxyFallback(2, 3);  // if 2 is also down, try 3
+// Pass fallback_config_id = 0 to clear config_id's fallback link.
+// Has no visible effect until ProxyBridge_SetHealthCheckEnabled(TRUE, ...) is
+// also called - until then every config is treated as healthy, matching the
+// original (pre-failover) behaviour exactly.
+PROXYBRIDGE_API BOOL ProxyBridge_SetProxyFallback(UINT32 config_id, UINT32 fallback_config_id)
+{
+    if (config_id == 0 || config_id == fallback_config_id)
+        return FALSE; // reject no-op ids and direct self-loops (longer cycles are still capped safely by find_healthy_proxy_config's hop limit)
+
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        if (g_proxy_configs[i].config_id == config_id)
+        {
+            g_proxy_configs[i].fallback_config_id = fallback_config_id;
+            log_message("Proxy config ID %u fallback -> %u", config_id, fallback_config_id);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// Enables/disables the background health-check thread that probes every proxy
+// config's reachability every interval_seconds (clamped to [5, 3600]) and
+// updates the failover selection used by check_process_rule(). Safe to call at
+// any time, including while ProxyBridge is actively running. Disabling resets
+// every config back to "healthy", so turning failover off always restores the
+// exact original routing behaviour immediately (no stale "down" state left over).
+PROXYBRIDGE_API BOOL ProxyBridge_SetHealthCheckEnabled(BOOL enabled, UINT32 interval_seconds)
+{
+    if (enabled)
+    {
+        if (interval_seconds < 5)    interval_seconds = 5;
+        if (interval_seconds > 3600) interval_seconds = 3600;
+        g_healthcheck_interval_sec = interval_seconds;
+
+        if (g_healthcheck_enabled)
+            return TRUE; // already running, interval updated above for its next cycle
+
+        if (g_healthcheck_stop_event == NULL)
+            g_healthcheck_stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+        else
+            ResetEvent(g_healthcheck_stop_event);
+
+        if (g_healthcheck_stop_event == NULL)
+            return FALSE;
+
+        g_healthcheck_enabled = TRUE;
+        g_healthcheck_thread = CreateThread(NULL, 0, healthcheck_thread_proc, NULL, 0, NULL);
+        if (g_healthcheck_thread == NULL)
+        {
+            g_healthcheck_enabled = FALSE;
+            return FALSE;
+        }
+
+        log_message("Health check enabled, interval %u sec", g_healthcheck_interval_sec);
+        return TRUE;
+    }
+    else
+    {
+        if (!g_healthcheck_enabled)
+            return TRUE;
+
+        g_healthcheck_enabled = FALSE;
+        if (g_healthcheck_stop_event) SetEvent(g_healthcheck_stop_event);
+        if (g_healthcheck_thread)
+        {
+            WaitForSingleObject(g_healthcheck_thread, 5000);
+            CloseHandle(g_healthcheck_thread);
+            g_healthcheck_thread = NULL;
+        }
+
+        for (int i = 0; i < g_proxy_config_count; i++)
+            InterlockedExchange(&g_proxy_configs[i].is_healthy, 1);
+
+        log_message("Health check disabled");
+        return TRUE;
+    }
+}
+
+// Returns 1 if config_id's last health check passed (or health-check is
+// disabled, or it hasn't been checked yet), 0 if it's currently marked down,
+// -1 if config_id doesn't exist. Meant for a GUI to show a live status dot.
+PROXYBRIDGE_API int ProxyBridge_IsProxyHealthy(UINT32 config_id)
+{
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        if (g_proxy_configs[i].config_id == config_id)
+            return g_healthcheck_enabled
+                ? (int)InterlockedCompareExchange(&g_proxy_configs[i].is_healthy, 1, 1)
+                : 1;
+    }
+    return -1;
+}
+
+// ── DNS resolution policy API (Extended ProxyBridge) ────────────────────────
+
+// servers: semicolon-separated "ip:port" list, e.g. "94.140.14.14:53;9.9.9.9:53".
+// Replaces any previously configured list. Pass "" or NULL to clear it.
+// Up to MAX_CUSTOM_DNS_SERVERS (8) servers; extras beyond that are ignored.
+PROXYBRIDGE_API BOOL ProxyBridge_SetCustomDnsServers(const char* servers)
+{
+    { WSADATA wsa_probe; WSAStartup(MAKEWORD(2, 2), &wsa_probe); } // see resolve_via_custom_dns for why
+
+    g_custom_dns_server_count = 0;
+    if (servers == NULL || servers[0] == '\0')
+        return TRUE;
+
+    char buf[512];
+    strncpy_s(buf, sizeof(buf), servers, _TRUNCATE);
+
+    char *ctx = NULL;
+    char *tok = strtok_s(buf, ";", &ctx);
+    while (tok != NULL && g_custom_dns_server_count < MAX_CUSTOM_DNS_SERVERS)
+    {
+        char ip_part[64];
+        UINT16 port = 53;
+
+        char *colon = strchr(tok, ':');
+        if (colon)
+        {
+            *colon = '\0';
+            port = (UINT16)atoi(colon + 1);
+            if (port == 0) port = 53;
+        }
+        strncpy_s(ip_part, sizeof(ip_part), tok, _TRUNCATE);
+
+        UINT32 ip = resolve_hostname(ip_part); // accepts either a literal IP or a hostname
+        if (ip != 0)
+        {
+            g_custom_dns_servers[g_custom_dns_server_count].ip   = ip;
+            g_custom_dns_servers[g_custom_dns_server_count].port = port;
+            g_custom_dns_server_count++;
+            log_message("Custom DNS server added: %s:%u", ip_part, port);
+        }
+        else
+        {
+            log_message("Custom DNS server skipped (could not resolve): %s", ip_part);
+        }
+
+        tok = strtok_s(NULL, ";", &ctx);
+    }
+
+    return TRUE;
+}
+
+// Exposed mainly for testing/diagnostics (mirrors ProxyBridge_TestProxyConfig's
+// role for proxies): resolves hostname using ONLY the configured custom DNS
+// servers, writing the dotted-decimal result into result_buffer. Returns TRUE
+// on success. Does not touch the fake-IP pool or system DNS - just the raw
+// custom-server DNS client in isolation.
+PROXYBRIDGE_API BOOL ProxyBridge_ResolveViaCustomDns(const char* hostname, char* result_buffer, size_t buffer_size)
+{
+    if (hostname == NULL || result_buffer == NULL || buffer_size < 8)
+        return FALSE;
+
+    UINT32 ip = resolve_via_custom_dns(hostname, 3000);
+    if (ip == 0)
+        return FALSE;
+
+    _snprintf_s(result_buffer, buffer_size, _TRUNCATE, "%u.%u.%u.%u",
+        ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
+    return TRUE;
+}
+
+// sources: semicolon-separated list of "proxy", "custom", "system" in priority
+// order, e.g. "proxy;custom;system" or just "custom". Up to 3 entries (extras
+// ignored); unrecognised tokens are skipped. Pass "" or NULL to clear the
+// policy (equivalent to never having called this - no DNS interception for
+// this rule's process, today's default behaviour).
+// Only meaningful for rules whose Action is PROXY; has no effect otherwise.
+PROXYBRIDGE_API BOOL ProxyBridge_SetRuleDnsResolution(UINT32 rule_id, const char* sources)
+{
+    AcquireSRWLockExclusive(&g_rules_lock);
+
+    PROCESS_RULE *rule = rules_list;
+    while (rule != NULL && rule->rule_id != rule_id)
+        rule = rule->next;
+
+    if (rule == NULL)
+    {
+        ReleaseSRWLockExclusive(&g_rules_lock);
+        return FALSE;
+    }
+
+    rule->dns_resolution_count = 0;
+
+    if (sources != NULL && sources[0] != '\0')
+    {
+        char buf[64];
+        strncpy_s(buf, sizeof(buf), sources, _TRUNCATE);
+
+        char *ctx = NULL;
+        char *tok = strtok_s(buf, ";", &ctx);
+        while (tok != NULL && rule->dns_resolution_count < 3)
+        {
+            DNS_SOURCE src;
+            if      (_stricmp(tok, "proxy")  == 0) src = DNS_SRC_PROXY;
+            else if (_stricmp(tok, "custom") == 0) src = DNS_SRC_CUSTOM;
+            else if (_stricmp(tok, "system") == 0) src = DNS_SRC_SYSTEM;
+            else { tok = strtok_s(NULL, ";", &ctx); continue; } // unrecognised token, skip
+
+            rule->dns_resolution[rule->dns_resolution_count++] = (UINT8)src;
+            tok = strtok_s(NULL, ";", &ctx);
+        }
+    }
+
+    log_message("Rule ID %u DNS resolution policy set (%u source%s)",
+        rule_id, rule->dns_resolution_count, rule->dns_resolution_count == 1 ? "" : "s");
+
+    ReleaseSRWLockExclusive(&g_rules_lock);
+    return TRUE;
+}
+
+PROXYBRIDGE_API int ProxyBridge_TestProxyConfig(UINT32 config_id, const char* target_host, UINT16 target_port, char* result_buffer, size_t buffer_size)
+{
+    PROXY_CONFIG *cfg = find_proxy_config(config_id);
+    if (cfg == NULL)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "No proxy config found", _TRUNCATE);
+        return -1;
+    }
+
+    UINT32 dest_ip = resolve_hostname(target_host);
+    if (dest_ip == 0)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to resolve target host", _TRUNCATE);
+        return -1;
+    }
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to create socket", _TRUNCATE);
+        return -1;
+    }
+
+    // Set timeout
+    DWORD timeout = 10000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+
+    struct sockaddr_in proxy_addr;
+    memset(&proxy_addr, 0, sizeof(proxy_addr));
+    proxy_addr.sin_family = AF_INET;
+    proxy_addr.sin_port   = htons(cfg->port);
+    UINT32 proxy_ip = resolve_hostname(cfg->host);
+    if (proxy_ip == 0)
+    {
+        closesocket(sock);
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to resolve proxy host", _TRUNCATE);
+        return -1;
+    }
+    proxy_addr.sin_addr.s_addr = proxy_ip;
+
+    if (connect(sock, (struct sockaddr*)&proxy_addr, sizeof(proxy_addr)) != 0)
+    {
+        closesocket(sock);
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to connect to proxy", _TRUNCATE);
+        return -1;
+    }
+
+    int result;
+    if (cfg->type == PROXY_TYPE_SOCKS5)
+        result = socks5_connect(sock, dest_ip, target_port, cfg);
+    else
+        result = http_connect(sock, dest_ip, target_port, cfg);
+
+    closesocket(sock);
+
+    if (result == 0)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Connection successful", _TRUNCATE);
+        return 0;
+    }
+    else
+    {
+        if (result_buffer && buffer_size > 0)
+            snprintf(result_buffer, buffer_size, "Connection failed (code %d)", result);
+        return result;
+    }
+}
+
+PROXYBRIDGE_API int ProxyBridge_TestProxyConfigEx(UINT32 config_id, const char* target_host, UINT16 target_port,
+                                                  ProxyTestLogCallback cb, void* user)
+{
+    #define TLOG(...) do { if (cb) { char _l[300]; _snprintf_s(_l, sizeof(_l), _TRUNCATE, __VA_ARGS__); cb(_l, user); } } while (0)
+
+    PROXY_CONFIG *cfg = find_proxy_config(config_id);
+    if (cfg == NULL) { TLOG("[FAIL] No proxy config found"); return -1; }
+    if (target_host == NULL || target_host[0] == '\0') target_host = "www.google.com";
+    if (target_port == 0) target_port = 80;
+
+    BOOL is_socks = (cfg->type == PROXY_TYPE_SOCKS5);
+    BOOL use_auth = (cfg->username[0] != '\0');
+
+    TLOG("Proxy:    %s:%u", cfg->host, cfg->port);
+    TLOG("Protocol: %s", is_socks ? "SOCKS5" : "HTTP");
+    TLOG("Auth:     %s", use_auth ? "yes" : "no");
+    TLOG("Target:   %s:%u", target_host, target_port);
+
+    UINT32 proxy_ip = resolve_hostname(cfg->host);
+    if (proxy_ip == 0) { TLOG(""); TLOG("[FAIL] Could not resolve proxy host '%s'", cfg->host); return -1; }
+    struct in_addr pa; pa.s_addr = proxy_ip;
+    TLOG("Proxy IP: %s", inet_ntoa(pa));
+
+    int overall = 0;
+
+    // ── Test 1: TCP connection to the proxy server ───────────────────────────
+    TLOG("");
+    TLOG("Test 1: Connection to the proxy server");
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) { TLOG("  [FAIL] Failed to create socket"); return -1; }
+    DWORD to = 10000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+    struct sockaddr_in paddr; memset(&paddr, 0, sizeof(paddr));
+    paddr.sin_family = AF_INET; paddr.sin_port = htons(cfg->port); paddr.sin_addr.s_addr = proxy_ip;
+    ULONGLONG c0 = GetTickCount64();
+    if (connect(s, (struct sockaddr*)&paddr, sizeof(paddr)) != 0)
+    {
+        TLOG("  [FAIL] Could not connect to the proxy server");
+        closesocket(s);
+        TLOG(""); TLOG("Testing finished: proxy is NOT reachable.");
+        return -1;
+    }
+    ULONGLONG c1 = GetTickCount64();
+    ULONGLONG connect_ms = c1 - c0;
+    TLOG("  Connection established (%llu ms)", connect_ms);
+    TLOG("  Test 1 passed");
+
+    // ── Test 2: Connection through the proxy server ──────────────────────────
+    TLOG("");
+    TLOG("Test 2: Connection through the proxy server");
+    UINT32 dest_ip = resolve_hostname(target_host);
+    if (dest_ip == 0)
+    {
+        TLOG("  [FAIL] Could not resolve target host '%s'", target_host);
+        closesocket(s);
+        overall = -1;
+    }
+    else
+    {
+        ULONGLONG h0 = GetTickCount64();
+        int rc = is_socks ? socks5_connect(s, dest_ip, target_port, cfg)
+                          : http_connect(s, dest_ip, target_port, cfg);
+        ULONGLONG h1 = GetTickCount64();
+        if (rc != 0)
+        {
+            TLOG("  [FAIL] Could not establish a tunnel through the proxy (code %d)", rc);
+            if (use_auth) TLOG("  Hint: verify the proxy credentials");
+            overall = -1;
+        }
+        else
+        {
+            if (use_auth) TLOG("  Authentication was successful");
+            TLOG("  Connection to %s:%u established through the proxy (%llu ms)", target_host, target_port, h1 - h0);
+
+            // Try to load a default web page (best-effort; needs a web server on the target).
+            char req[256];
+            int rn = _snprintf_s(req, sizeof(req), _TRUNCATE,
+                                 "GET / HTTP/1.0\r\nHost: %s\r\nUser-Agent: ProxyBridge-Check\r\nConnection: close\r\n\r\n",
+                                 target_host);
+            if (rn > 0 && send(s, req, rn, 0) == rn)
+            {
+                char resp[512]; int got = recv(s, resp, sizeof(resp) - 1, 0);
+                if (got > 0)
+                {
+                    resp[got] = '\0';
+                    if (strncmp(resp, "HTTP/", 5) == 0)
+                    {
+                        char status[64] = {0};
+                        const char* nl = strchr(resp, '\r'); size_t sl = nl ? (size_t)(nl - resp) : 0;
+                        if (sl > 0 && sl < sizeof(status)) { memcpy(status, resp, sl); status[sl] = 0; }
+                        TLOG("  Default web page loaded: %s", status[0] ? status : "HTTP response received");
+                    }
+                    else TLOG("  Received %d bytes (non-HTTP target)", got);
+                }
+                else TLOG("  Note: no page data returned (target may not run a web server)");
+            }
+            TLOG("  Test 2 passed");
+        }
+    }
+    closesocket(s);
+
+    // ── Test 3: Proxy server latency ─────────────────────────────────────────
+    TLOG("");
+    TLOG("Test 3: Proxy server latency");
+    TLOG("  Latency = %llu ms", connect_ms);
+    TLOG("  Test 3 passed");
+
+    // ── Test 4: SOCKS5 UDP ASSOCIATE support ─────────────────────────────────
+    if (is_socks)
+    {
+        TLOG("");
+        TLOG("Test 4: SOCKS5 UDP ASSOCIATE support");
+        SOCKET us = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (us != INVALID_SOCKET)
+        {
+            setsockopt(us, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+            setsockopt(us, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+            if (connect(us, (struct sockaddr*)&paddr, sizeof(paddr)) == 0)
+            {
+                struct sockaddr_in relay; memset(&relay, 0, sizeof(relay));
+                int urc = socks5_udp_associate_with_config(us, &relay, cfg);
+                if (urc == 0)
+                {
+                    TLOG("  UDP ASSOCIATE granted; relay = %s:%u", inet_ntoa(relay.sin_addr), ntohs(relay.sin_port));
+                    TLOG("  UDP is supported by this proxy");
+                }
+                else TLOG("  UDP ASSOCIATE refused - this proxy does not support UDP");
+            }
+            else TLOG("  Could not open a control connection for the UDP test");
+            closesocket(us);
+        }
+    }
+
+    TLOG("");
+    TLOG(overall == 0 ? "Testing finished: proxy is ready to work." : "Testing finished with errors.");
+    return overall;
+
+    #undef TLOG
+}
+
+PROXYBRIDGE_API void ProxyBridge_SetLocalhostViaProxy(BOOL enable)
+{
+    g_localhost_via_proxy = enable;
+    log_message("Localhost routing: %s (most proxies block localhost for SSRF prevention)", enable ? "via proxy" : "direct");
+}
+
+PROXYBRIDGE_API void ProxyBridge_SetLogCallback(LogCallback callback)
+{
+    g_log_callback = callback;
+}
+
+PROXYBRIDGE_API void ProxyBridge_SetConnectionCallback(ConnectionCallback callback)
+{
+    g_connection_callback = callback;
+}
+
+PROXYBRIDGE_API void ProxyBridge_SetTrafficLoggingEnabled(BOOL enable)
+{
+    g_traffic_logging_enabled = enable;
+    if (!enable)
+    {
+        clear_logged_connections();
+    }
+}
+
+PROXYBRIDGE_API void ProxyBridge_ClearConnectionLogs(void)
+{
+    clear_logged_connections();
+    log_message("Connection logs cleared");
+}
+
+// Check if connection already logged (deduplication)
+static BOOL is_connection_already_logged(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action)
+{
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&lock);
+
+    LOGGED_CONNECTION *logged = logged_connections;
+    while (logged != NULL)
+    {
+        if (logged->pid == pid &&
+            logged->dest_ip == dest_ip &&
+            logged->dest_port == dest_port &&
+            logged->action == action)
+        {
+            found = TRUE;
+            break;
+        }
+        logged = logged->next;
+    }
+
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
+
+static void add_logged_connection(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action)
+{
+    AcquireSRWLockExclusive(&lock);
+
+    // Use the running counter instead of re-walking the whole list on every add.
+    if (g_logged_count >= 100)
+    {
+        LOGGED_CONNECTION *temp = logged_connections;
+        for (int i = 0; i < 98 && temp != NULL; i++)
+            temp = temp->next;
+
+        if (temp != NULL && temp->next != NULL)
+        {
+            LOGGED_CONNECTION *to_free_list = temp->next;
+            temp->next = NULL;
+
+            int freed = 0;
+            ReleaseSRWLockExclusive(&lock);
+            while (to_free_list != NULL)
+            {
+                LOGGED_CONNECTION *next = to_free_list->next;
+                free(to_free_list);
+                to_free_list = next;
+                freed++;
+            }
+            AcquireSRWLockExclusive(&lock);
+            g_logged_count -= freed;
+        }
+    }
+
+    LOGGED_CONNECTION *logged = (LOGGED_CONNECTION *)malloc(sizeof(LOGGED_CONNECTION));
+    if (logged != NULL)
+    {
+        logged->pid = pid;
+        logged->dest_ip = dest_ip;
+        logged->dest_port = dest_port;
+        logged->action = action;
+        logged->next = logged_connections;
+        logged_connections = logged;
+        g_logged_count++;
+    }
+
+    ReleaseSRWLockExclusive(&lock);
+}
+
+static void clear_logged_connections(void)
+{
+    AcquireSRWLockExclusive(&lock);
+
+    while (logged_connections != NULL)
+    {
+        LOGGED_CONNECTION *to_free = logged_connections;
+        logged_connections = logged_connections->next;
+        free(to_free);
+    }
+    g_logged_count = 0;
+
+    ReleaseSRWLockExclusive(&lock);
+}
+
+//  cache pid
+// This can be imprroved
+// Need to work on this before releease for potential collusion
+// need to remove unwanted entires from table
+static UINT32 pid_cache_hash(UINT32 src_ip, UINT16 src_port, BOOL is_udp)
+{
+    UINT32 hash = src_ip ^ ((UINT32)src_port << 16) ^ (is_udp ? 0x80000000 : 0);
+    return hash % PID_CACHE_SIZE;
+}
+
+static DWORD get_cached_pid(UINT32 src_ip, UINT16 src_port, BOOL is_udp)
+{
+    UINT32 hash = pid_cache_hash(src_ip, src_port, is_udp);
+    ULONGLONG current_time = GetTickCount64();
+    DWORD pid = 0;
+
+    AcquireSRWLockShared(&lock);
+
+    PID_CACHE_ENTRY *entry = pid_cache[hash];
+    while (entry != NULL)
+    {
+        if (entry->src_ip == src_ip &&
+            entry->src_port == src_port &&
+            entry->is_udp == is_udp)
+        {
+            pid = (current_time - entry->timestamp < PID_CACHE_TTL_MS) ? entry->pid : 0;
+            break;
+        }
+        entry = entry->next;
+    }
+
+    ReleaseSRWLockShared(&lock);
+    return pid;
+}
+
+static void cache_pid(UINT32 src_ip, UINT16 src_port, DWORD pid, BOOL is_udp)
+{
+    UINT32 hash = pid_cache_hash(src_ip, src_port, is_udp);
+    ULONGLONG current_time = GetTickCount64();
+
+    AcquireSRWLockExclusive(&lock);
+
+    PID_CACHE_ENTRY *entry = pid_cache[hash];
+    while (entry != NULL)
+    {
+        if (entry->src_ip == src_ip &&
+            entry->src_port == src_port &&
+            entry->is_udp == is_udp)
+        {
+            entry->pid = pid;
+            entry->timestamp = current_time;
+            ReleaseSRWLockExclusive(&lock);
+            return;
+        }
+        entry = entry->next;
+    }
+
+    PID_CACHE_ENTRY *new_entry = (PID_CACHE_ENTRY *)malloc(sizeof(PID_CACHE_ENTRY));
+    if (new_entry != NULL)
+    {
+        new_entry->src_ip = src_ip;
+        new_entry->src_port = src_port;
+        new_entry->pid = pid;
+        new_entry->timestamp = current_time;
+        new_entry->is_udp = is_udp;
+        new_entry->next = pid_cache[hash];
+        pid_cache[hash] = new_entry;
+    }
+
+    ReleaseSRWLockExclusive(&lock);
+}
+
+static void clear_pid_cache(void)
+{
+    AcquireSRWLockExclusive(&lock);
+
+    for (int i = 0; i < PID_CACHE_SIZE; i++)
+    {
+        while (pid_cache[i] != NULL)
+        {
+            PID_CACHE_ENTRY *to_free = pid_cache[i];
+            pid_cache[i] = pid_cache[i]->next;
+            free(to_free);
+        }
+    }
+
+    ReleaseSRWLockExclusive(&lock);
+}
+
+// Evict the cached PID for a specific (src_ip, src_port). Called when a new TCP
+// connection begins (fresh SYN) on a port: Windows reuses ephemeral ports, so any
+// PID cached for that port may belong to the previous, now-closed process. Without
+// this, a reused port could be matched against the wrong application's rule for up to
+// PID_CACHE_TTL_MS. Forcing a re-lookup here keeps the decision correct.
+static void remove_cached_pid(UINT32 src_ip, UINT16 src_port, BOOL is_udp)
+{
+    UINT32 hash = pid_cache_hash(src_ip, src_port, is_udp);
+
+    AcquireSRWLockExclusive(&lock);
+    PID_CACHE_ENTRY **pp = &pid_cache[hash];
+    while (*pp != NULL)
+    {
+        if ((*pp)->src_ip == src_ip && (*pp)->src_port == src_port && (*pp)->is_udp == is_udp)
+        {
+            PID_CACHE_ENTRY *to_free = *pp;
+            *pp = (*pp)->next;
+            free(to_free);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+// Prune expired PID-cache entries so the table doesn't grow without bound over a long
+// session (entries were previously only ignored on lookup, never freed).
+static void cleanup_stale_pid_cache(void)
+{
+    ULONGLONG now = GetTickCount64();
+
+    AcquireSRWLockExclusive(&lock);
+    for (int i = 0; i < PID_CACHE_SIZE; i++)
+    {
+        PID_CACHE_ENTRY **pp = &pid_cache[i];
+        while (*pp != NULL)
+        {
+            if (now - (*pp)->timestamp >= PID_CACHE_TTL_MS)
+            {
+                PID_CACHE_ENTRY *to_free = *pp;
+                *pp = (*pp)->next;
+                free(to_free);
+            }
+            else
+            {
+                pp = &(*pp)->next;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+// Prune expired DNS-snoop entries (IPv4 + IPv6) so the caches don't grow without bound.
+static void cleanup_stale_dns_cache(void)
+{
+    ULONGLONG now = GetTickCount64();
+
+    AcquireSRWLockExclusive(&g_dns_cache_lock);
+    for (int i = 0; i < DNS_CACHE_BUCKETS; i++)
+    {
+        DNS_CACHE_ENTRY **pp = &g_dns_cache[i];
+        while (*pp != NULL)
+        {
+            if ((*pp)->expire_tick <= now)
+            {
+                DNS_CACHE_ENTRY *to_free = *pp;
+                *pp = (*pp)->next;
+                free(to_free);
+            }
+            else
+            {
+                pp = &(*pp)->next;
+            }
+        }
+
+        DNS_CACHE_ENTRY_V6 **pp6 = &g_dns_cache_v6[i];
+        while (*pp6 != NULL)
+        {
+            if ((*pp6)->expire_tick <= now)
+            {
+                DNS_CACHE_ENTRY_V6 *to_free = *pp6;
+                *pp6 = (*pp6)->next;
+                free(to_free);
+            }
+            else
+            {
+                pp6 = &(*pp6)->next;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_dns_cache_lock);
+}
+
+// Dedicated cleanup thread - runs independently without blocking packet processing
+static DWORD WINAPI cleanup_worker(LPVOID arg)
+{
+    while (running)
+    {
+        Sleep(30000);  // 30 seconds
+        if (running)
+        {
+            cleanup_stale_connections();
+            cleanup_stale_pid_cache();
+            cleanup_stale_dns_cache();
+        }
+    }
+    return 0;
+}
+
+// Flush the Windows DNS resolver cache so applications re-resolve hostnames on the
+// wire, where our port-53 snoop can capture the IP->hostname mapping. Without this a
+// domain that was resolved before a domain rule existed would have no cached mapping
+// and the rule could not match. DnsFlushResolverCache is loaded dynamically so we
+// avoid a hard dnsapi.lib dependency (keeps the MinGW/GCC build path unchanged).
+static void flush_dns_resolver_cache(void)
+{
+    HMODULE dnsapi = LoadLibraryA("dnsapi.dll");
+    if (dnsapi == NULL)
+        return;
+    typedef BOOL (WINAPI *DnsFlushFn)(void);
+    DnsFlushFn fn = (DnsFlushFn)GetProcAddress(dnsapi, "DnsFlushResolverCache");
+    if (fn != NULL)
+        fn();
+    FreeLibrary(dnsapi);
+}
+
+// Recomputes the fast-path flags. Takes the shared rules lock itself, so callers must
+// NOT already hold g_rules_lock exclusive (SRW locks are non-recursive) - the rule API
+// functions below release their exclusive lock before calling this.
+static void update_has_active_rules(void)
+{
+    BOOL has_active = FALSE;
+    BOOL has_domain = FALSE;
+
+    AcquireSRWLockShared(&g_rules_lock);
+    PROCESS_RULE *rule = rules_list;
+    while (rule != NULL)
+    {
+        if (rule->enabled)
+        {
+            has_active = TRUE;
+            if (rule_has_domain_filter(rule))
+            {
+                has_domain = TRUE;
+                break;  // both flags are now known
+            }
+        }
+        rule = rule->next;
+    }
+    ReleaseSRWLockShared(&g_rules_lock);
+
+    g_has_active_rules = has_active;
+
+    // Edge trigger: when domain rules first become active, flush the OS DNS cache so
+    // subsequent connections re-resolve and populate our snoop cache.
+    if (has_domain && !g_has_domain_rules && running)
+        flush_dns_resolver_cache();
+    g_has_domain_rules = has_domain;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
+{
+    char filter[FILTER_BUFFER_SIZE];
+    INT16 priority = 123;
+
+    if (running)
+        return FALSE;
+
+    InitializeSRWLock(&lock);
+    dns_cache_init();
+
+    // If domain rules were configured before start, flush the OS DNS cache so the very
+    // first connections re-resolve on the wire and populate our IP->hostname snoop cache.
+    if (g_has_domain_rules)
+        flush_dns_resolver_cache();
+
+    running = TRUE;
+
+    proxy_thread = CreateThread(NULL, 1, local_proxy_server, NULL, 0, NULL);
+    if (proxy_thread == NULL)
+    {
+        running = FALSE;
+        return FALSE;
+    }
+
+    // Start cleanup thread to avoid blocking packet processing
+    cleanup_thread = CreateThread(NULL, 1, cleanup_worker, NULL, 0, NULL);
+    if (cleanup_thread == NULL)
+    {
+        running = FALSE;
+        WaitForSingleObject(proxy_thread, INFINITE);
+        CloseHandle(proxy_thread);
+        proxy_thread = NULL;
+        return FALSE;
+    }
+
+    if (any_socks5_config())
+    {
+        udp_relay_thread = CreateThread(NULL, 1, udp_relay_server, NULL, 0, NULL);
+        if (udp_relay_thread == NULL)
+        {
+            running = FALSE;
+            WaitForSingleObject(cleanup_thread, INFINITE);
+            CloseHandle(cleanup_thread);
+            cleanup_thread = NULL;
+            WaitForSingleObject(proxy_thread, INFINITE);
+            CloseHandle(proxy_thread);
+            proxy_thread = NULL;
+            return FALSE;
+        }
+    }
+
+    Sleep(500);
+
+    // "not impostor" ensures WinDivert never re-captures packets it already injected.
+    // Without this, each WinDivertSend re-enters the capture queue, creating
+    // re-injection loops that delay delivery by seconds and cause DTLS handshake
+    // failures.  With "not impostor", injected packets bypass the driver entirely
+    // and flow directly to the OS - zero extra hops, no loops.
+    // DHCP is deliberately excluded at the filter level so those packets never enter
+    // ProxyBridge at all. DHCP is link-local broadcast (0.0.0.0 -> 255.255.255.255) and
+    // #161  DHCPv4: client 68 / server 67     DHCPv6: client 546 / server 547
+    snprintf(filter, sizeof(filter),
+        "not impostor and ("
+        "(tcp and (outbound or loopback or (tcp.DstPort == %d or tcp.SrcPort == %d))) or "
+        "(udp and (outbound or loopback or (udp.DstPort == %d or udp.SrcPort == %d)) and "
+            "udp.SrcPort != 67 and udp.DstPort != 67 and udp.SrcPort != 68 and udp.DstPort != 68) or "
+        "(udp and not outbound and udp.SrcPort == 53) or "
+        "(ipv6 and udp and not outbound and udp.SrcPort == 53) or "
+        "(ipv6 and tcp and (outbound or loopback or (tcp.DstPort == %d or tcp.SrcPort == %d))) or "
+        "(ipv6 and udp and (outbound or loopback or (udp.DstPort == %d or udp.SrcPort == %d)) and "
+            "udp.SrcPort != 546 and udp.DstPort != 546 and udp.SrcPort != 547 and udp.DstPort != 547))",
+        g_local_relay_port, g_local_relay_port, LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT,
+        g_local_relay_port, g_local_relay_port, LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT);
+
+    // Note: Added 'loopback' to filter to capture localhost (127.x.x.x) traffic
+    // This enables proxying local connections for MITM scenarios
+    windivert_handle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, priority, 0);
+    if (windivert_handle == INVALID_HANDLE_VALUE)
+    {
+        DWORD wd_err = GetLastError();
+        switch (wd_err)
+        {
+            case 2:    // ERROR_FILE_NOT_FOUND
+                log_message("Failed to open WinDivert (%lu): WinDivert64.sys not found - it may have been quarantined or deleted by antivirus. Whitelist WinDivert64.sys and this program's DLL in your AV and reinstall.", wd_err);
+                break;
+            case 5:    // ERROR_ACCESS_DENIED
+                log_message("Failed to open WinDivert (%lu): Access denied - make sure ProxyBridge is running as Administrator.", wd_err);
+                break;
+            case 577:  // ERROR_INVALID_IMAGE_HASH - driver signature check failed
+                log_message("Failed to open WinDivert (%lu): Driver signature verification failed - WinDivert64.sys may have been modified or blocked by security software. Reinstall ProxyBridge.", wd_err);
+                break;
+            case 1058: // ERROR_SERVICE_DISABLED
+                log_message("Failed to open WinDivert (%lu): A stale WinDivert driver entry from a previous install is marked disabled. Reinstall ProxyBridge to fix it, or manually delete the registry key: HKLM\\SYSTEM\\CurrentControlSet\\Services\\WinDivert", wd_err);
+                break;
+            case 1275: // ERROR_DRIVER_BLOCKED
+                log_message("Failed to open WinDivert (%lu): WinDivert64.sys is blocked by Windows security policy or antivirus (BYOVD protection). Whitelist WinDivert64.sys in your security software.", wd_err);
+                break;
+            default:
+                log_message("Failed to open WinDivert (%lu): Ensure ProxyBridge is installed correctly and running as Administrator.", wd_err);
+                break;
+        }
+        running = FALSE;
+        WaitForSingleObject(proxy_thread, INFINITE);
+        CloseHandle(proxy_thread);
+        proxy_thread = NULL;
+        return FALSE;
+    }
+
+    // WINDIVERT_PARAM_QUEUE_LENGTH: max packets in queue (range 32–16384).
+    // Under heavy upload the kernel enqueues bursts of outbound packets faster
+    // than the 4 packet threads can drain them; a full queue drops arriving
+    // packets → TCP sees loss → retransmit + congestion-window halving.
+    WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_LENGTH, 16384);
+    // WINDIVERT_PARAM_QUEUE_TIME: ms a packet waits before being dropped
+    // (range 100–16000, default 2000).  The old value of 8 ms was below the
+    // minimum (100 ms) and caused aggressive packet drops under any sustained
+    // upload load, directly producing the 40-60% upload throughput loss.
+    WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_TIME, 2000);
+    // WINDIVERT_PARAM_QUEUE_SIZE: max total bytes in queue (range 65535–33553920).
+    // Raise to the maximum so a burst of large packets never hits a byte cap.
+    WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_SIZE, 33553920);
+
+    for (int i = 0; i < NUM_PACKET_THREADS; i++)
+    {
+        packet_thread[i] = CreateThread(NULL, 0, packet_processor, NULL, 0, NULL);
+        if (packet_thread[i] == NULL)
+        {
+            running = FALSE;
+            for (int j = 0; j < i; j++)
+            {
+                if (packet_thread[j] != NULL)
+                {
+                    WaitForSingleObject(packet_thread[j], 5000);
+                    CloseHandle(packet_thread[j]);
+                    packet_thread[j] = NULL;
+                }
+            }
+            WinDivertClose(windivert_handle);
+            windivert_handle = INVALID_HANDLE_VALUE;
+            WaitForSingleObject(proxy_thread, INFINITE);
+            CloseHandle(proxy_thread);
+            proxy_thread = NULL;
+            return FALSE;
+        }
+    }
+
+    update_has_active_rules();
+
+    log_message("ProxyBridge started");
+    log_message("Local relay: localhost:%d", g_local_relay_port);
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        PROXY_CONFIG *cfg = &g_proxy_configs[i];
+        log_message("Proxy config ID %u: %s %s:%u",
+            cfg->config_id,
+            cfg->type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
+            cfg->host, cfg->port);
+    }
+    if (g_proxy_config_count == 0)
+        log_message("Warning: No proxy configs configured");
+
+    int rule_count = 0;
+    PROCESS_RULE *rule = rules_list;
+    while (rule != NULL)
+    {
+        const char *action_str = (rule->action == RULE_ACTION_PROXY) ? "PROXY" :
+                                 (rule->action == RULE_ACTION_BLOCK) ? "BLOCK" : "DIRECT";
+        log_message("Rule: %s -> %s", rule->process_name, action_str);
+        rule_count++;
+        rule = rule->next;
+    }
+    if (rule_count == 0)
+        log_message("No rules configured - all traffic will be direct");
+
+    return TRUE;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
+{
+    if (!running)
+        return FALSE;
+
+    running = FALSE;
+
+    // Extended ProxyBridge: tear down the failover health-check thread too, so
+    // nothing outlives ProxyBridge_Stop() (important if the DLL gets unloaded
+    // right after). Safe no-op if it was never enabled.
+    ProxyBridge_SetHealthCheckEnabled(FALSE, 0);
+
+    if (windivert_handle != INVALID_HANDLE_VALUE)
+    {
+        WinDivertShutdown(windivert_handle, WINDIVERT_SHUTDOWN_BOTH);
+        WinDivertClose(windivert_handle);
+        windivert_handle = INVALID_HANDLE_VALUE;
+    }
+
+    // process alll packets before we stop, make sure packets are not dropped
+    for (int i = 0; i < NUM_PACKET_THREADS; i++)
+    {
+        if (packet_thread[i] != NULL)
+        {
+            WaitForSingleObject(packet_thread[i], 1000);  // 1 second timeout
+            CloseHandle(packet_thread[i]);
+            packet_thread[i] = NULL;
+        }
+    }
+
+    if (proxy_thread != NULL)
+    {
+        WaitForSingleObject(proxy_thread, 1000);  // 1 second timeout
+        CloseHandle(proxy_thread);
+        proxy_thread = NULL;
+    }
+
+    if (cleanup_thread != NULL)
+    {
+        WaitForSingleObject(cleanup_thread, 1000);  // 1 second timeout
+        CloseHandle(cleanup_thread);
+        cleanup_thread = NULL;
+    }
+
+    if (udp_relay_thread != NULL)
+    {
+        WaitForSingleObject(udp_relay_thread, 1000);  // 1 second timeout
+        CloseHandle(udp_relay_thread);
+        udp_relay_thread = NULL;
+    }
+
+    AcquireSRWLockExclusive(&lock);
+    for (int i = 0; i < CONNECTION_HASH_SIZE; i++)
+    {
+        while (connection_hash_table[i] != NULL)
+        {
+            CONNECTION_INFO *to_free = connection_hash_table[i];
+            connection_hash_table[i] = connection_hash_table[i]->next;
+            free(to_free);
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+
+    // Clear logged connections list
+    clear_logged_connections();
+
+    clear_pid_cache();
+
+    // Release the reusable owner-PID table scratch buffer (packet thread has stopped).
+    free(g_pidtbl_buf);
+    g_pidtbl_buf = NULL;
+    g_pidtbl_cap = 0;
+
+    // Reset per-port decision cache so stale entries don't carry over
+    // if ProxyBridge is stopped and restarted with different rules.
+    memset((void*)port_decided_bitmap, 0, sizeof(port_decided_bitmap));
+    memset((void*)port_direct_bitmap,  0, sizeof(port_direct_bitmap));
+
+    log_message("ProxyBridge stopped");
+
+    return TRUE;
+}
+
+
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
+{
+    switch (fdwReason)
+    {
+        case DLL_PROCESS_ATTACH:
+        {
+            // Store the PID of the process that loaded this DLL
+            g_current_process_id = GetCurrentProcessId();
+            // Initialize Winsock here so that resolve_hostname() / getaddrinfo()
+            // work correctly when AddProxyConfig is called before any thread
+            WSADATA wsa;
+            WSAStartup(MAKEWORD(2, 2), &wsa);
+            break;
+        }
+        case DLL_PROCESS_DETACH:
+            WSACleanup();
+            if (running)
+                ProxyBridge_Stop();
+            // Close all proxy config UDP sockets
+            for (int i = 0; i < g_proxy_config_count; i++)
+            {
+                PROXY_CONFIG *cfg = &g_proxy_configs[i];
+                if (cfg->udp_tcp_ctrl != INVALID_SOCKET)  { closesocket(cfg->udp_tcp_ctrl);  cfg->udp_tcp_ctrl  = INVALID_SOCKET; }
+                if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); cfg->udp_send_sock = INVALID_SOCKET; }
+            }
+            AcquireSRWLockExclusive(&g_rules_lock);
+            while (rules_list != NULL)
+            {
+                PROCESS_RULE *to_free = rules_list;
+                rules_list = rules_list->next;
+
+                if (to_free->target_hosts != NULL)
+                    free(to_free->target_hosts);
+                if (to_free->target_ports != NULL)
+                    free(to_free->target_ports);
+                if (to_free->target_domains != NULL)
+                    free(to_free->target_domains);
+
+                free(to_free);
+            }
+            ReleaseSRWLockExclusive(&g_rules_lock);
+            break;
+    }
+    return TRUE;
+}
