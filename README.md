@@ -61,26 +61,32 @@ If you hit issues, please open an issue with `--verbose 3` output.
 
 ## Architecture and Windows version
 
-**Only 64-bit (x64) builds exist right now.** Every build in this repo
-was produced with `x86_64-w64-mingw32-gcc`; a 32-bit (x86) build has
-never been made or tested. If you need x86, it should be a
-straightforward rebuild (`i686-w64-mingw32-gcc` against WinDivert's
-`x86/` SDK folder instead of `x64/`), but nobody has done or verified
-that yet — treat it as untested until someone does.
+**Both 64-bit (x64) and 32-bit (x86) builds are available**, built from
+the identical source. Compiled with `x86_64-w64-mingw32-gcc` and
+`i686-w64-mingw32-gcc` respectively, and both were actually run (not
+just compiled) under Wine — the 32-bit build needed a dedicated
+`WINEARCH=win32` Wine prefix to test at all, since a normal 64-bit Wine
+prefix can't run 32-bit binaries without one. Along the way this caught
+a real pre-existing bug in upstream ProxyBridge's CLI (a missing
+`#include <shellapi.h>` that happened to still link on x64 by luck, but
+failed outright on x86) — fixed in both builds here.
 
-**Minimum Windows version: Windows 7** (not Vista/Server 2008 — see
-[this discussion](../../issues) if that assumption is ever revisited).
-This isn't a guess: it comes directly from two things lining up —
-WinDivert 2.2.2's own upstream README states it supports "Windows 7,
-Windows 8 and Windows 10" (older WinDivert 1.x docs mention Vista/Server
-2008, but that's a different, older version of WinDivert, not the one
-this project uses), and this fork's own code is compiled with
-`_WIN32_WINNT=0x0601` (the Windows 7 API baseline) — so both the driver
-dependency and our own build target agree on Windows 7 as the floor.
-Windows 8/8.1/10/11 should all work too (WinDivert explicitly supports
-them); nothing about this fork's own additions should narrow that range
-further, but only Windows 10/11 has actually been used during
-development.
+**Minimum Windows version: Windows 7** (not Vista/Server 2008). This
+isn't a guess: it comes directly from two things lining up — WinDivert
+2.2.2's own upstream README states it supports "Windows 7, Windows 8 and
+Windows 10" (older WinDivert 1.x docs mention Vista/Server 2008, but
+that's a different, older version of WinDivert, not the one this project
+uses), and this fork's own code is compiled with `_WIN32_WINNT=0x0601`
+(the Windows 7 API baseline) — so both the driver dependency and our own
+build target agree on Windows 7 as the floor. Windows 8/8.1/10/11 should
+all work too (WinDivert explicitly supports them); nothing about this
+fork's own additions should narrow that range further, but only Windows
+10/11 has actually been used during development.
+
+Vista/Server 2008 support hasn't been attempted and isn't planned right
+now, but was looked into — see [`docs/VISTA_COMPATIBILITY.md`](docs/VISTA_COMPATIBILITY.md)
+for a concrete assessment of what it would take and how risky it looks,
+in case that need comes up later.
 
 ## Download / build
 
@@ -91,26 +97,38 @@ source in this repo — you still need to add WinDivert's own files, see
 To build yourself (Linux, cross-compiling with mingw-w64):
 
 ```bash
-sudo apt install gcc-mingw-w64-x86-64
+sudo apt install gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
 curl -sLO https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
 unzip WinDivert-2.2.2-A.zip
 
-# Core DLL
+# ── x64 ──────────────────────────────────────────────────────────────
 x86_64-w64-mingw32-gcc -std=gnu11 -shared -O2 -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS \
   -I WinDivert-2.2.2-A/include Windows/src/ProxyBridge.c \
   -L WinDivert-2.2.2-A/x64 -lWinDivert -lws2_32 -liphlpapi \
   -o ProxyBridgeCore.dll
 
-# CLI
 x86_64-w64-mingw32-gcc -std=gnu11 -O2 -D_WIN32_WINNT=0x0601 \
   Windows/cli/main.c -lwinhttp -lshell32 -ladvapi32 \
   -o ProxyBridge_CLI.exe
+
+# ── x86 ──────────────────────────────────────────────────────────────
+i686-w64-mingw32-gcc -std=gnu11 -shared -O2 -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS \
+  -I WinDivert-2.2.2-A/include Windows/src/ProxyBridge.c \
+  -L WinDivert-2.2.2-A/x86 -lWinDivert -lws2_32 -liphlpapi \
+  -o ProxyBridgeCore32.dll
+
+i686-w64-mingw32-gcc -std=gnu11 -O2 -D_WIN32_WINNT=0x0601 \
+  Windows/cli/main.c -lwinhttp -lshell32 -ladvapi32 \
+  -o ProxyBridge_CLI32.exe
 ```
 
 Copy `ProxyBridgeCore.dll`, `ProxyBridge_CLI.exe`, `WinDivert.dll`, and
 `WinDivert64.sys` (from the WinDivert release zip's `x64/` folder) into
-the same directory on a Windows machine. Administrator rights are
-required (WinDivert needs kernel-level access).
+the same directory on a Windows machine for the x64 build — or the x86
+equivalents plus **both** `WinDivert32.sys` and `WinDivert64.sys` (see
+[`prebuilt/README.md`](prebuilt/README.md) for why both) for the x86
+build. Administrator rights are required either way (WinDivert needs
+kernel-level access).
 
 ## Documentation
 

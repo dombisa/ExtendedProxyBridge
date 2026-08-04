@@ -1,21 +1,42 @@
-# Pre-built binaries (x64 only)
+# Pre-built binaries
 
-`ProxyBridge_CLI.exe` and `ProxyBridgeCore.dll` — 64-bit (x64) builds,
-via `x86_64-w64-mingw32-gcc` from the exact source in `Windows/src` and
-`Windows/cli` in this repo (see the main README for the build command,
-if you'd rather build them yourself and verify). No 32-bit (x86) build
-exists yet — see the main README's "Architecture and Windows version"
-section.
+Both architectures are built from the exact same source in `Windows/src`
+and `Windows/cli` in this repo.
 
-**You still need two more files before this runs**, which aren't ours to
-redistribute — download them from the official WinDivert release:
+- **`x64/`** — 64-bit build (`x86_64-w64-mingw32-gcc`). Use this on a
+  64-bit Windows install, which is almost certainly what you have unless
+  you know otherwise.
+- **`x86/`** — 32-bit build (`i686-w64-mingw32-gcc`). For 32-bit Windows,
+  or to run a 32-bit process on 64-bit Windows if you specifically need
+  that.
+
+Both were tested to actually load and run correctly under Wine (32-bit
+under a dedicated `WINEARCH=win32` prefix, since a normal 64-bit Wine
+prefix can't run 32-bit binaries without one) — including the failover
+health-check logic against real sockets, not just "it compiled".
+
+## You still need WinDivert's own files
+
+Not ours to redistribute — download them from the official release:
 
 https://github.com/basil00/WinDivert/releases/tag/v2.2.2
 
-Grab `WinDivert.dll` and `WinDivert64.sys` from the `x64/` folder inside
-that zip, and put them in this same folder next to the two files above.
-All four files need to be together for the program to run.
+- For `x64/`: grab `WinDivert.dll` and `WinDivert64.sys` from the `x64/`
+  folder in that zip.
+- For `x86/`: grab `WinDivert.dll` **and both** `WinDivert32.sys` **and**
+  `WinDivert64.sys` from the `x86/` folder in that zip. Yes, both .sys
+  files — a 32-bit process needs the 32-bit driver on 32-bit Windows,
+  but still needs the 64-bit driver if it's running on 64-bit Windows
+  under WOW64 (a kernel driver always matches the OS's own bitness, not
+  the process's). WinDivert's own DLL picks the right one automatically
+  at runtime, you just need both present.
 
-See the main [README.md](../README.md) for what's tested and what isn't
-yet — in particular, real WinDivert packet interception (including the
-new DNS interception) has **not** been verified on real Windows yet.
+Put the matching WinDivert files in the same folder as
+`ProxyBridge_CLI.exe`/`ProxyBridgeCore.dll` for whichever architecture
+you're using — all files together, one architecture per folder, don't
+mix x64 and x86 files in the same folder.
+
+See the main [README.md](../README.md) for what's tested and what
+isn't yet — in particular, real WinDivert packet interception
+(including the new DNS interception) has **not** been verified on real
+Windows yet, for either architecture.
