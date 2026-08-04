@@ -59,6 +59,29 @@ against the real WinDivert SDK headers, DNS packet building/parsing
 tested standalone) but not live packet injection on a real network stack.
 If you hit issues, please open an issue with `--verbose 3` output.
 
+## Architecture and Windows version
+
+**Only 64-bit (x64) builds exist right now.** Every build in this repo
+was produced with `x86_64-w64-mingw32-gcc`; a 32-bit (x86) build has
+never been made or tested. If you need x86, it should be a
+straightforward rebuild (`i686-w64-mingw32-gcc` against WinDivert's
+`x86/` SDK folder instead of `x64/`), but nobody has done or verified
+that yet — treat it as untested until someone does.
+
+**Minimum Windows version: Windows 7** (not Vista/Server 2008 — see
+[this discussion](../../issues) if that assumption is ever revisited).
+This isn't a guess: it comes directly from two things lining up —
+WinDivert 2.2.2's own upstream README states it supports "Windows 7,
+Windows 8 and Windows 10" (older WinDivert 1.x docs mention Vista/Server
+2008, but that's a different, older version of WinDivert, not the one
+this project uses), and this fork's own code is compiled with
+`_WIN32_WINNT=0x0601` (the Windows 7 API baseline) — so both the driver
+dependency and our own build target agree on Windows 7 as the floor.
+Windows 8/8.1/10/11 should all work too (WinDivert explicitly supports
+them); nothing about this fork's own additions should narrow that range
+further, but only Windows 10/11 has actually been used during
+development.
+
 ## Download / build
 
 Pre-built binaries: [`prebuilt/`](prebuilt) (compiled straight from the

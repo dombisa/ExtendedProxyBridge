@@ -1,9 +1,11 @@
-# Pre-built binaries
+# Pre-built binaries (x64 only)
 
-`ProxyBridge_CLI.exe` and `ProxyBridgeCore.dll` — built via
-`x86_64-w64-mingw32-gcc` from the exact source in `Windows/src` and
+`ProxyBridge_CLI.exe` and `ProxyBridgeCore.dll` — 64-bit (x64) builds,
+via `x86_64-w64-mingw32-gcc` from the exact source in `Windows/src` and
 `Windows/cli` in this repo (see the main README for the build command,
-if you'd rather build them yourself and verify).
+if you'd rather build them yourself and verify). No 32-bit (x86) build
+exists yet — see the main README's "Architecture and Windows version"
+section.
 
 **You still need two more files before this runs**, which aren't ours to
 redistribute — download them from the official WinDivert release:
