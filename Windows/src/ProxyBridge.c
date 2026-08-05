@@ -496,6 +496,10 @@ static BOOL   is_fake_ip(UINT32 ip);
 static void   dns_cache_store(UINT32 ip, const char *domain); // defined later; fake_ip_alloc needs it earlier
 static BOOL   dns_parse_name(const UINT8 *msg, int msg_len, int *offset, char *dst, int dst_len); // defined later
 static BOOL   get_dns_policy_for_process(const char *process_name, UINT8 *out_sources, UINT8 *out_count);
+static int    build_dns_response_packet(const UINT8 *query, int query_len, UINT32 answer_ip,
+                                         UINT32 client_ip, UINT16 client_port,
+                                         UINT32 dns_server_ip, UINT16 dns_server_port,
+                                         UINT8 *out_packet, size_t out_packet_size);
 static BOOL   dns_intercept_query(const unsigned char *packet, UINT packet_len, WINDIVERT_ADDRESS *addr,
                                    PWINDIVERT_IPHDR ip_header, PWINDIVERT_UDPHDR udp_header,
                                    const UINT8 *dns_payload, int dns_payload_len, DWORD pid);
@@ -1656,6 +1660,72 @@ typedef struct {
     UINT8  source_count;
 } DNS_INTERCEPT_CTX;
 
+// Builds a complete spoofed DNS response packet (IP + UDP + DNS headers) into
+// out_packet, reusing the original query's question section byte-for-byte
+// (transaction ID included) so the application's own matching logic accepts
+// it as a real reply. Pure byte-construction, no I/O - split out from
+// dns_resolve_worker specifically so it can be unit-tested without needing a
+// real WinDivert handle. Returns the total packet length, or 0 on failure
+// (query too malformed to find where the question section ends).
+static int build_dns_response_packet(const UINT8 *query, int query_len, UINT32 answer_ip,
+                                      UINT32 client_ip, UINT16 client_port,
+                                      UINT32 dns_server_ip, UINT16 dns_server_port,
+                                      UINT8 *out_packet, size_t out_packet_size)
+{
+    int name_offset = 12;
+    char domain_unused[256];
+    if (!dns_parse_name(query, query_len, &name_offset, domain_unused, sizeof(domain_unused)))
+        return 0;
+
+    if (out_packet_size < sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR) + 512 + 16)
+        return 0; // caller's buffer too small - see the sizing used at the one call site
+
+    memset(out_packet, 0, out_packet_size);
+
+    PWINDIVERT_IPHDR  resp_ip  = (PWINDIVERT_IPHDR)out_packet;
+    PWINDIVERT_UDPHDR resp_udp = (PWINDIVERT_UDPHDR)(out_packet + sizeof(WINDIVERT_IPHDR));
+    UINT8 *dns_out = out_packet + sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR);
+
+    // DNS header: same transaction ID, standard response with 1 answer.
+    memcpy(dns_out, query, 2);                    // transaction ID, copied verbatim
+    dns_out[2] = 0x81; dns_out[3] = 0x80;         // standard query response, recursion available, no error
+    dns_out[4] = 0x00; dns_out[5] = 0x01;         // QDCOUNT = 1
+    dns_out[6] = 0x00; dns_out[7] = 0x01;         // ANCOUNT = 1
+    dns_out[8] = 0x00; dns_out[9] = 0x00;         // NSCOUNT = 0
+    dns_out[10] = 0x00; dns_out[11] = 0x00;       // ARCOUNT = 0
+
+    int qsection_len = name_offset + 4 - 12;      // question section length (name + QTYPE + QCLASS)
+    memcpy(dns_out + 12, query + 12, qsection_len);
+    int pos = 12 + qsection_len;
+
+    // Answer RR: pointer back to the question's name, A record, our resolved/fake IP.
+    dns_out[pos++] = 0xC0; dns_out[pos++] = 0x0C; // name = pointer to offset 12
+    dns_out[pos++] = 0x00; dns_out[pos++] = 0x01; // TYPE = A
+    dns_out[pos++] = 0x00; dns_out[pos++] = 0x01; // CLASS = IN
+    dns_out[pos++] = 0x00; dns_out[pos++] = 0x00; dns_out[pos++] = 0x00; dns_out[pos++] = 0x3C; // TTL = 60s
+    dns_out[pos++] = 0x00; dns_out[pos++] = 0x04; // RDLENGTH = 4
+    memcpy(dns_out + pos, &answer_ip, 4);
+    pos += 4;
+
+    int dns_len = pos;
+    int udp_len = sizeof(WINDIVERT_UDPHDR) + dns_len;
+    int ip_len  = sizeof(WINDIVERT_IPHDR) + udp_len;
+
+    resp_ip->Version  = 4;
+    resp_ip->HdrLength = sizeof(WINDIVERT_IPHDR) / 4;
+    resp_ip->Length   = htons((UINT16)ip_len);
+    resp_ip->TTL      = 64;
+    resp_ip->Protocol = IPPROTO_UDP;
+    resp_ip->SrcAddr  = dns_server_ip;  // spoofed: "from" the DNS server the app actually queried
+    resp_ip->DstAddr  = client_ip;
+
+    resp_udp->SrcPort = htons(dns_server_port);
+    resp_udp->DstPort = htons(client_port);
+    resp_udp->Length  = htons((UINT16)udp_len);
+
+    return ip_len;
+}
+
 static DWORD WINAPI dns_resolve_worker(LPVOID arg)
 {
     DNS_INTERCEPT_CTX *ctx = (DNS_INTERCEPT_CTX *)arg;
@@ -1698,52 +1768,17 @@ static DWORD WINAPI dns_resolve_worker(LPVOID arg)
         return 0;
     }
 
-    // Build the spoofed response: real IP/UDP/DNS headers, reusing the
-    // original question section byte-for-byte (transaction ID included, so
-    // the application's own matching logic accepts it as a real reply).
     UINT8 packet[sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR) + 512 + 16];
-    memset(packet, 0, sizeof(packet));
-
-    PWINDIVERT_IPHDR  resp_ip  = (PWINDIVERT_IPHDR)packet;
-    PWINDIVERT_UDPHDR resp_udp = (PWINDIVERT_UDPHDR)(packet + sizeof(WINDIVERT_IPHDR));
-    UINT8 *dns_out = packet + sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR);
-
-    // DNS header: same transaction ID, standard response with 1 answer.
-    memcpy(dns_out, ctx->query, 2);              // transaction ID, copied verbatim
-    dns_out[2] = 0x81; dns_out[3] = 0x80;         // standard query response, recursion available, no error
-    dns_out[4] = 0x00; dns_out[5] = 0x01;         // QDCOUNT = 1
-    dns_out[6] = 0x00; dns_out[7] = 0x01;         // ANCOUNT = 1
-    dns_out[8] = 0x00; dns_out[9] = 0x00;         // NSCOUNT = 0
-    dns_out[10] = 0x00; dns_out[11] = 0x00;       // ARCOUNT = 0
-
-    int qsection_len = name_offset + 4 - 12;      // question section length (name + QTYPE + QCLASS)
-    memcpy(dns_out + 12, ctx->query + 12, qsection_len);
-    int pos = 12 + qsection_len;
-
-    // Answer RR: pointer back to the question's name, A record, our resolved/fake IP.
-    dns_out[pos++] = 0xC0; dns_out[pos++] = 0x0C; // name = pointer to offset 12
-    dns_out[pos++] = 0x00; dns_out[pos++] = 0x01; // TYPE = A
-    dns_out[pos++] = 0x00; dns_out[pos++] = 0x01; // CLASS = IN
-    dns_out[pos++] = 0x00; dns_out[pos++] = 0x00; dns_out[pos++] = 0x00; dns_out[pos++] = 0x3C; // TTL = 60s
-    dns_out[pos++] = 0x00; dns_out[pos++] = 0x04; // RDLENGTH = 4
-    memcpy(dns_out + pos, &answer_ip, 4);
-    pos += 4;
-
-    int dns_len = pos;
-    int udp_len = sizeof(WINDIVERT_UDPHDR) + dns_len;
-    int ip_len  = sizeof(WINDIVERT_IPHDR) + udp_len;
-
-    resp_ip->Version  = 4;
-    resp_ip->HdrLength = sizeof(WINDIVERT_IPHDR) / 4;
-    resp_ip->Length   = htons((UINT16)ip_len);
-    resp_ip->TTL      = 64;
-    resp_ip->Protocol = IPPROTO_UDP;
-    resp_ip->SrcAddr  = ctx->dns_server_ip;  // spoofed: "from" the DNS server the app actually queried
-    resp_ip->DstAddr  = ctx->client_ip;
-
-    resp_udp->SrcPort = htons(ctx->dns_server_port);
-    resp_udp->DstPort = htons(ctx->client_port);
-    resp_udp->Length  = htons((UINT16)udp_len);
+    int ip_len = build_dns_response_packet(ctx->query, ctx->query_len, answer_ip,
+                                            ctx->client_ip, ctx->client_port,
+                                            ctx->dns_server_ip, ctx->dns_server_port,
+                                            packet, sizeof(packet));
+    if (ip_len == 0)
+    {
+        log_message("DNS intercept: failed to build response packet for '%s'", domain);
+        free(ctx);
+        return 0;
+    }
 
     WINDIVERT_ADDRESS addr;
     memset(&addr, 0, sizeof(addr));
@@ -5600,6 +5635,24 @@ PROXYBRIDGE_API BOOL ProxyBridge_SetRuleDnsResolution(UINT32 rule_id, const char
 
     ReleaseSRWLockExclusive(&g_rules_lock);
     return TRUE;
+}
+
+// Diagnostic/test-only export: builds a spoofed DNS response for a given raw
+// query, exactly like the real interception path would, but as a pure
+// function with no WinDivert I/O - lets the response construction itself be
+// verified (byte layout, checksum-readiness) without a live driver. Returns
+// the packet length written to out_packet, or 0 on failure.
+PROXYBRIDGE_API int ProxyBridge_TestBuildDnsResponse(
+    const UINT8* query, int query_len, UINT32 answer_ip,
+    UINT32 client_ip, UINT16 client_port,
+    UINT32 dns_server_ip, UINT16 dns_server_port,
+    UINT8* out_packet, int out_packet_size)
+{
+    if (out_packet_size < 0)
+        return 0;
+    return build_dns_response_packet(query, query_len, answer_ip,
+        client_ip, client_port, dns_server_ip, dns_server_port,
+        out_packet, (size_t)out_packet_size);
 }
 
 PROXYBRIDGE_API int ProxyBridge_TestProxyConfig(UINT32 config_id, const char* target_host, UINT16 target_port, char* result_buffer, size_t buffer_size)

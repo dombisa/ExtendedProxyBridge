@@ -75,6 +75,10 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void);
 PROXYBRIDGE_API BOOL ProxyBridge_SetCustomDnsServers(const char* servers);
 PROXYBRIDGE_API BOOL ProxyBridge_ResolveViaCustomDns(const char* hostname, char* result_buffer, size_t buffer_size);
 PROXYBRIDGE_API BOOL ProxyBridge_SetRuleDnsResolution(UINT32 rule_id, const char* sources);
+PROXYBRIDGE_API int ProxyBridge_TestBuildDnsResponse(const UINT8* query, int query_len, UINT32 answer_ip,
+                                                      UINT32 client_ip, UINT16 client_port,
+                                                      UINT32 dns_server_ip, UINT16 dns_server_port,
+                                                      UINT8* out_packet, int out_packet_size);
 #ifdef __cplusplus
 }
 #endif

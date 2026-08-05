@@ -47,17 +47,23 @@ sockets under Wine: health-check detection against a live/dead TCP
 listener, the hand-rolled DNS client against a real DNS server (including
 correctly handling NXDOMAIN), the service install/start/stop/uninstall
 cycle against Wine's Service Control Manager, and full `.pbprofile` →
-CLI → DLL wiring for every feature above.
+CLI → DLL wiring for every feature above. The spoofed DNS response packet
+itself — the exact bytes that would get handed to `WinDivertSend` — is
+now verified field-by-field (IP header version/length/protocol/spoofed
+source address, UDP ports/length, DNS transaction ID/flags/answer count,
+the question section copied verbatim, the answer record's name pointer/
+type/class/TTL/length/IP) on **both** x64 and x86 builds, byte-identical
+between them.
 
 **What could not be tested in that environment, and needs verification on
-real Windows before you rely on it:** the actual WinDivert packet capture
-and injection path — including the DNS-query interception itself (the
-piece that hands out fake IPs and injects spoofed responses). Wine has no
-real kernel driver, so `WinDivertOpen()` always fails there. Sandbox
-testing verified the surrounding logic (packet field layouts checked
-against the real WinDivert SDK headers, DNS packet building/parsing
-tested standalone) but not live packet injection on a real network stack.
-If you hit issues, please open an issue with `--verbose 3` output.
+real Windows before you rely on it:** actually calling `WinDivertOpen()`/
+`WinDivertSend()` against a real kernel driver — i.e. whether the
+correctly-built packet above actually gets delivered the way it's
+supposed to. Wine has no real kernel driver, so `WinDivertOpen()` always
+fails there; that one call is the ceiling on what a sandbox can verify
+here, everything upstream of it (packet construction, field layouts
+checked against the real WinDivert SDK headers, byte-level DNS parsing)
+has been. If you hit issues, please open an issue with `--verbose 3` output.
 
 ## Architecture and Windows version
 
