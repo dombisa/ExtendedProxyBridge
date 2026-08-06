@@ -312,6 +312,16 @@ program just ignores them — or delete them if you don't need them.
                            no fallback. Only takes effect when
                            HealthCheckEnabled=true at the top level.
 
+    "ChainToConfigId"       Number. (Our addition.) Id of another proxy
+                           in this same file — after connecting to THIS
+                           proxy, tunnel through the referenced one next
+                           instead of reaching the real destination
+                           directly. 0 or omitted = no chaining (connect
+                           straight to the real destination, as always).
+                           Can be set on the referenced proxy too, to
+                           build a chain longer than two hops. See
+                           section 6.10.
+
 
 5.3. Fields of one rule (inside "ProxyRules")
 ----------------------------------------------------
@@ -628,6 +638,59 @@ rule):
 
 To remove the service entirely and go back to running it manually:
     ProxyBridge_CLI.exe --uninstall-service
+
+
+6.10. Proxy chaining
+-------------------------
+Goal: route traffic through more than one proxy in sequence - connect to
+proxy A, which tunnels to proxy B, which finally reaches the real site.
+Proxy types can be freely mixed (SOCKS5 -> HTTP, HTTP -> SOCKS5, or
+longer chains).
+
+File: 8_proxy_chaining.pbprofile.
+
+Key idea: "ChainToConfigId" on a proxy config (inside "ProxyConfigs")
+points at another config's Id. Rules never reference the chain directly
+- they still just point at the entry proxy's Id via ProxyConfigId, and
+the chaining happens transparently once a connection is being
+established. A chain can be longer than two hops by setting
+ChainToConfigId on the second hop too, and so on.
+
+What "chaining" means at the protocol level: after the normal handshake
+with the entry proxy completes, instead of asking it to connect to the
+real destination, it's asked to connect to the NEXT hop's own address.
+Once that succeeds, the connection is a transparent tunnel straight
+through to that next hop - so the next handshake (either to the real
+destination, or to a third hop) happens right on the same connection,
+indistinguishable from talking to that proxy directly.
+
+Limitation: intermediate hops (every hop except the last) are always
+dialled as plain IPv4, even if the final destination is IPv6 or a
+cached domain name. Proxy servers are overwhelmingly deployed with an
+IPv4 address of their own regardless of what traffic they carry, so
+this keeps the feature tractable. The FINAL hop is unaffected by this
+and keeps full IPv6/domain support exactly as any non-chained
+connection always has.
+
+Chaining and failover (FallbackConfigId, section 6.7) are independent
+and can be combined freely on the same proxy config: failover decides
+WHICH config gets used (based on health), and chaining decides what
+that chosen config does once it's the one in use. E.g. proxy Id=1 can
+have both FallbackConfigId=2 (if 1 is down, use 2 instead) and
+ChainToConfigId=3 (if 1 is used, tunnel it through 3) at the same time,
+with neither setting interfering with the other.
+
+
+6.11. Everything together
+------------------------------
+There's no rule against combining every feature in this document into
+a single profile - failover, chaining, custom DNS, per-rule DNS policy,
+path-based rules, domain rules, LAN exceptions, blocking, and a
+catch-all, all at once. File 9_full_combination_test.pbprofile does
+exactly that, purely as a demonstration that nothing about one feature
+interferes with another - it's not a realistic profile to use as-is
+(the proxy addresses in it are placeholders), but every field in it is
+a genuine, valid combination you could build a real profile out of.
 
 
 7. TROUBLESHOOTING

@@ -151,7 +151,7 @@ kernel-level access).
 - [`docs/README.txt`](docs/README.txt) — full manual: every CLI command,
   every `.pbprofile` field, walkthroughs for every usage scenario,
   troubleshooting.
-- [`profiles/`](profiles) — seven annotated example `.pbprofile` files
+- [`profiles/`](profiles) — nine annotated example `.pbprofile` files
   covering single-app proxying, multiple proxies, path-based rules,
   domain-based routing, blocking + LAN exceptions, automatic failover,
   and the three DNS resolution priority modes.
