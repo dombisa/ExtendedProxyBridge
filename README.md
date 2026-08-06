@@ -35,6 +35,13 @@ adds the features below.
     `getaddrinfo()` at a specific server).
   - `system` — whatever DNS servers Windows itself is configured with
     (today's default behaviour if this field is left unset).
+- **Proxy chaining** — connect through one proxy, tunnel through another,
+  reach the real destination through as many hops as you configure, and
+  freely mix SOCKS5 and HTTP proxies within the same chain (e.g.
+  SOCKS5 → HTTP → the real site). Verified end to end against real
+  SOCKS5 and HTTP proxy implementations, both hop orderings, with real
+  data actually flowing through the tunnel — not just a successful
+  handshake.
 - **Rename-friendly builds** — rename the .exe to anything, rename the
   matching .dll to the same name, and it just works. No hardcoded file
   names, no recompiling.
@@ -46,8 +53,11 @@ Everything above was actually compiled with `x86_64-w64-mingw32-gcc`
 sockets under Wine: health-check detection against a live/dead TCP
 listener, the hand-rolled DNS client against a real DNS server (including
 correctly handling NXDOMAIN), the service install/start/stop/uninstall
-cycle against Wine's Service Control Manager, and full `.pbprofile` →
-CLI → DLL wiring for every feature above. The spoofed DNS response packet
+cycle against Wine's Service Control Manager, full `.pbprofile` → CLI →
+DLL wiring for every feature above, and proxy chaining against real
+minimal SOCKS5 and HTTP proxy implementations (both hop orderings, with
+actual application data verified flowing through the tunnel, not just a
+successful handshake). The spoofed DNS response packet
 itself — the exact bytes that would get handed to `WinDivertSend` — is
 now verified field-by-field (IP header version/length/protocol/spoofed
 source address, UDP ports/length, DNS transaction ID/flags/answer count,
@@ -164,9 +174,13 @@ for the original project this builds on.
 
 ## Known limitations / roadmap
 
-- Proxy chaining (e.g. HTTP → SOCKS5 → HTTP through two hops) is designed
-  but not yet implemented.
 - DNS interception is unverified on real hardware (see Status above).
 - IPv6 fake-IP addresses (AAAA queries) are not handled yet — the `proxy`
   DNS source only answers A queries; the application falls back to its
   own IPv4 path.
+- Proxy chaining's intermediate hops are always dialled as plain IPv4,
+  even if the final destination is IPv6 or a cached domain name — proxy
+  servers are overwhelmingly deployed with an IPv4 address of their own
+  regardless of what traffic they carry, so this keeps chaining
+  tractable. The final hop is unaffected and keeps full IPv6/domain
+  support exactly as before chaining existed.

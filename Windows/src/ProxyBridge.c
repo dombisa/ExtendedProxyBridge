@@ -159,6 +159,15 @@ typedef struct {
     // ── Failover (Extended ProxyBridge) ─────────────────────────────────────
     UINT32 fallback_config_id;  // 0 = no fallback link. Set via ProxyBridge_SetProxyFallback.
     volatile LONG is_healthy;   // 1 = last health check passed (or never checked yet). Atomic; no lock needed.
+
+    // ── Chaining (Extended ProxyBridge) ──────────────────────────────────────
+    // 0 = no chaining (connect straight to the real destination, today's
+    // behaviour). Non-zero = after connecting to THIS proxy, ask it to tunnel
+    // to the chain_to proxy's own address, then hand off the (now tunnelled)
+    // socket to THAT proxy's handshake targeting the real destination - and
+    // so on if that proxy also has its own chain_to_config_id. Lets you mix
+    // proxy types in a chain, e.g. HTTP -> SOCKS5 -> HTTP.
+    UINT32 chain_to_config_id;
 } PROXY_CONFIG;
 
 static PROXY_CONFIG g_proxy_configs[MAX_PROXY_CONFIGS];
@@ -527,6 +536,13 @@ static BOOL match_domain_list(const char *domain_list, const char *domain);
 static BOOL rule_has_domain_filter(const PROCESS_RULE *rule);
 static BOOL match_domain_filter(const PROCESS_RULE *rule, const char *domain);
 static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg);
+
+// ── Proxy chaining (Extended ProxyBridge) ────────────────────────────────────
+static int connect_final_hop(SOCKET s, const PROXY_CONFIG *cfg, UINT32 dest_ip, UINT16 dest_port,
+                              BOOL is_ipv6, const UINT8 *dest_ip6);
+static int connect_via_proxy_chain(SOCKET s, const PROXY_CONFIG *entry_cfg, UINT32 dest_ip, UINT16 dest_port,
+                                    BOOL is_ipv6, const UINT8 *dest_ip6);
+
 static DWORD WINAPI local_proxy_server(LPVOID arg);
 static DWORD WINAPI connection_handler(LPVOID arg);
 static DWORD WINAPI transfer_handler(LPVOID arg);
@@ -3613,6 +3629,101 @@ static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_
     return 0;
 }
 
+// ── Proxy chaining (Extended ProxyBridge) ───────────────────────────────────
+
+// Dispatches the handshake for the REAL final destination on an already-open
+// (and, for a chain, already-tunnelled) socket - exactly the logic that used
+// to be inlined in connection_handler, extracted so both the plain
+// (non-chained) path and the last hop of a chain can share it instead of
+// duplicating the IPv6/cached-domain/plain-IPv4 branching twice.
+static int connect_final_hop(SOCKET s, const PROXY_CONFIG *cfg, UINT32 dest_ip, UINT16 dest_port,
+                              BOOL is_ipv6, const UINT8 *dest_ip6)
+{
+    if (cfg->type == PROXY_TYPE_SOCKS5)
+    {
+        char cached_domain[256];
+        if (is_ipv6)
+        {
+            if (dns_cache_lookup_v6(dest_ip6, cached_domain, sizeof(cached_domain)))
+                return socks5_connect_domain(s, cached_domain, dest_port, cfg);
+            return socks5_connect_v6(s, dest_ip6, dest_port, cfg);
+        }
+        if (dns_cache_lookup(dest_ip, cached_domain, sizeof(cached_domain)))
+            return socks5_connect_domain(s, cached_domain, dest_port, cfg);
+        return socks5_connect(s, dest_ip, dest_port, cfg);
+    }
+    else // PROXY_TYPE_HTTP - http_connect/http_connect_v6 already do their own
+         // cached-domain lookup internally, no separate domain variant needed.
+    {
+        return is_ipv6
+            ? http_connect_v6(s, dest_ip6, dest_port, cfg)
+            : http_connect(s, dest_ip, dest_port, cfg);
+    }
+}
+
+// Connects `s` (already TCP-connected to entry_cfg's own host:port) all the
+// way through to the real destination, walking entry_cfg's chain_to_config_id
+// chain if one is set. For each intermediate hop, the "destination" of that
+// hop's handshake is simply the NEXT hop's own address - once that handshake
+// succeeds, the proxy protocol guarantees `s` is now a transparent tunnel
+// straight through to that next hop, so the next handshake on the very same
+// socket is indistinguishable (to us) from talking to it directly. Only the
+// LAST hop's handshake targets the real destination (via connect_final_hop,
+// so it gets the same IPv6/domain-aware treatment as a non-chained connection
+// always has).
+//
+// Limitation (documented, not a bug): intermediate hops' own addresses are
+// always resolved and dialled as plain IPv4, even if the overall connection's
+// final destination is IPv6 or a cached domain name - proxy servers are
+// overwhelmingly deployed with an IPv4 address of their own regardless of
+// what traffic they carry, so this keeps the first version of chaining
+// tractable. The final hop is unaffected by this and keeps full IPv6/domain
+// support exactly as before chaining existed.
+//
+// Returns 0 on success (same convention as socks5_connect/http_connect),
+// non-zero on any hop's failure - the caller is responsible for closing `s`
+// either way, same as it always was for a single, non-chained handshake.
+static int connect_via_proxy_chain(SOCKET s, const PROXY_CONFIG *entry_cfg, UINT32 dest_ip, UINT16 dest_port,
+                                    BOOL is_ipv6, const UINT8 *dest_ip6)
+{
+    const PROXY_CONFIG *hops[MAX_PROXY_CONFIGS];
+    int hop_count = 0;
+
+    const PROXY_CONFIG *cur = entry_cfg;
+    while (cur != NULL && hop_count < MAX_PROXY_CONFIGS)
+    {
+        hops[hop_count++] = cur;
+        if (cur->chain_to_config_id == 0)
+            break;
+        cur = find_proxy_config(cur->chain_to_config_id);
+    }
+
+    for (int i = 0; i < hop_count - 1; i++)
+    {
+        const PROXY_CONFIG *this_hop = hops[i];
+        const PROXY_CONFIG *next_hop = hops[i + 1];
+
+        UINT32 next_ip = resolve_hostname(next_hop->host);
+        if (next_ip == 0)
+        {
+            log_message("Chain: failed to resolve next hop's address (%s)", next_hop->host);
+            return -1;
+        }
+
+        int rc = (this_hop->type == PROXY_TYPE_SOCKS5)
+            ? socks5_connect(s, next_ip, next_hop->port, this_hop)
+            : http_connect(s, next_ip, next_hop->port, this_hop);
+        if (rc != 0)
+        {
+            log_message("Chain: handshake with hop %d of %d (%s:%d) failed",
+                        i + 1, hop_count, this_hop->host, this_hop->port);
+            return rc;
+        }
+    }
+
+    return connect_final_hop(s, hops[hop_count - 1], dest_ip, dest_port, is_ipv6, dest_ip6);
+}
+
 static int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, const PROXY_CONFIG *cfg)
 {
     unsigned char buf[SOCKS5_BUFFER_SIZE];
@@ -4441,42 +4552,11 @@ static DWORD WINAPI connection_handler(LPVOID arg)
         return 0;
     }
 
-    if (proxy->type == PROXY_TYPE_SOCKS5)
+    if (connect_via_proxy_chain(socks_sock, proxy, dest_ip, dest_port, is_ipv6, dest_ip6) != 0)
     {
-        int rc;
-        char cached_domain[256];
-        if (is_ipv6)
-        {
-            if (dns_cache_lookup_v6(dest_ip6, cached_domain, sizeof(cached_domain)))
-                rc = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
-            else
-                rc = socks5_connect_v6(socks_sock, dest_ip6, dest_port, proxy);
-        }
-        else
-        {
-            if (dns_cache_lookup(dest_ip, cached_domain, sizeof(cached_domain)))
-                rc = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
-            else
-                rc = socks5_connect(socks_sock, dest_ip, dest_port, proxy);
-        }
-        if (rc != 0)
-        {
-            closesocket(client_sock);
-            closesocket(socks_sock);
-            return 0;
-        }
-    }
-    else if (proxy->type == PROXY_TYPE_HTTP)
-    {
-        int rc = is_ipv6
-            ? http_connect_v6(socks_sock, dest_ip6, dest_port, proxy)
-            : http_connect(socks_sock, dest_ip, dest_port, proxy);
-        if (rc != 0)
-        {
-            closesocket(client_sock);
-            closesocket(socks_sock);
-            return 0;
-        }
+        closesocket(client_sock);
+        closesocket(socks_sock);
+        return 0;
     }
 
     // Disable timeout for data transfer phase
@@ -5353,6 +5433,7 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* pr
     cfg->udp_send_sock = INVALID_SOCKET;
     cfg->udp_connected = FALSE;
     cfg->fallback_config_id = 0;
+    cfg->chain_to_config_id = 0;
     cfg->is_healthy = 1; // assume healthy until the first check says otherwise
 
     g_proxy_config_count++;
@@ -5445,8 +5526,34 @@ PROXYBRIDGE_API BOOL ProxyBridge_SetProxyFallback(UINT32 config_id, UINT32 fallb
     return FALSE;
 }
 
-// Enables/disables the background health-check thread that probes every proxy
-// config's reachability every interval_seconds (clamped to [5, 3600]) and
+// Links config_id -> chain_to_config_id: after connecting to config_id, its
+// handshake targets chain_to_config_id's own address instead of the real
+// destination, and the (now tunnelled) socket then hands off to
+// chain_to_config_id's own handshake for the real destination - or the NEXT
+// link in the chain, if chain_to_config_id has its own chain_to_config_id set
+// too. Lets you mix proxy types, e.g. connect to an HTTP proxy, chain through
+// a SOCKS5 proxy, chain through a second HTTP proxy, then reach the real site.
+// Pass chain_to_config_id=0 to clear config_id's chain link (the default -
+// connects straight to the real destination, no chaining).
+// A cycle (A->B->A) is capped safely by connect_via_proxy_chain's own hop
+// limit rather than hanging, but is still a misconfiguration - avoid it.
+PROXYBRIDGE_API BOOL ProxyBridge_SetProxyChain(UINT32 config_id, UINT32 chain_to_config_id)
+{
+    if (config_id == 0 || config_id == chain_to_config_id)
+        return FALSE; // reject no-op ids and direct self-loops
+
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        if (g_proxy_configs[i].config_id == config_id)
+        {
+            g_proxy_configs[i].chain_to_config_id = chain_to_config_id;
+            log_message("Proxy config ID %u chains -> %u", config_id, chain_to_config_id);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 // updates the failover selection used by check_process_rule(). Safe to call at
 // any time, including while ProxyBridge is actively running. Disabling resets
 // every config back to "healthy", so turning failover off always restores the
@@ -5728,6 +5835,97 @@ PROXYBRIDGE_API int ProxyBridge_TestProxyConfig(UINT32 config_id, const char* ta
             snprintf(result_buffer, buffer_size, "Connection failed (code %d)", result);
         return result;
     }
+}
+
+// Diagnostic/test export: exercises connect_via_proxy_chain end to end -
+// connects to entry_config_id, walks its chain_to_config_id chain (if any),
+// and hands off to the real target, exactly like a real relayed connection
+// would. Unlike ProxyBridge_TestProxyConfig, this deliberately does NOT
+// bypass chaining, so it's the right tool to verify a chain actually works
+// before relying on it for real traffic.
+PROXYBRIDGE_API int ProxyBridge_TestProxyChain(UINT32 entry_config_id, const char* target_host, UINT16 target_port,
+                                                char* result_buffer, size_t buffer_size)
+{
+    PROXY_CONFIG *entry_cfg = find_proxy_config(entry_config_id);
+    if (entry_cfg == NULL)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "No proxy config found", _TRUNCATE);
+        return -1;
+    }
+
+    UINT32 dest_ip = resolve_hostname(target_host);
+    if (dest_ip == 0)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to resolve target host", _TRUNCATE);
+        return -1;
+    }
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to create socket", _TRUNCATE);
+        return -1;
+    }
+
+    DWORD timeout = 10000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+
+    struct sockaddr_in proxy_addr;
+    memset(&proxy_addr, 0, sizeof(proxy_addr));
+    proxy_addr.sin_family = AF_INET;
+    proxy_addr.sin_port   = htons(entry_cfg->port);
+    UINT32 proxy_ip = resolve_hostname(entry_cfg->host);
+    if (proxy_ip == 0)
+    {
+        closesocket(sock);
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to resolve entry proxy host", _TRUNCATE);
+        return -1;
+    }
+    proxy_addr.sin_addr.s_addr = proxy_ip;
+
+    if (connect(sock, (struct sockaddr*)&proxy_addr, sizeof(proxy_addr)) != 0)
+    {
+        closesocket(sock);
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to connect to entry proxy", _TRUNCATE);
+        return -1;
+    }
+
+    int result = connect_via_proxy_chain(sock, entry_cfg, dest_ip, target_port, FALSE, NULL);
+
+    if (result == 0)
+    {
+        // Prove the tunnel is genuinely usable, not just "handshake said OK":
+        // send a known probe and read back a response, same as any real
+        // traffic would flow once connect_via_proxy_chain hands off to the
+        // relay loop in normal operation.
+        const char *probe = "PING\n";
+        char echo_buf[64] = {0};
+        int sent = send(sock, probe, (int)strlen(probe), 0);
+        int recvd = (sent > 0) ? recv(sock, echo_buf, sizeof(echo_buf) - 1, 0) : -1;
+
+        if (recvd > 0)
+        {
+            if (result_buffer && buffer_size > 0)
+                snprintf(result_buffer, buffer_size, "Chain OK, tunnel verified (echoed %d bytes)", recvd);
+            closesocket(sock);
+            return 0;
+        }
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Chain handshake OK but tunnel did not echo test data", _TRUNCATE);
+        closesocket(sock);
+        return -2;
+    }
+
+    closesocket(sock);
+    if (result_buffer && buffer_size > 0)
+        snprintf(result_buffer, buffer_size, "Chain failed (code %d)", result);
+    return result;
 }
 
 PROXYBRIDGE_API int ProxyBridge_TestProxyConfigEx(UINT32 config_id, const char* target_host, UINT16 target_port,

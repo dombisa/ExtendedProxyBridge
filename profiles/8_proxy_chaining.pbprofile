@@ -1,0 +1,41 @@
+{
+  "_readme": "SCENARIO 8: PROXY CHAINING (mixed types). Traffic goes through a SOCKS5 proxy first, which in turn tunnels through an HTTP proxy, which finally reaches the real destination. New capability, not in the original ProxyBridge.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+  "ProxyConfigs": [
+    {
+      "_note": "Entry hop (Id=1): SOCKS5. Rules point here. ChainToConfigId=2 means: after connecting here, tunnel through proxy Id=2 next, instead of going straight to the real destination.",
+      "Id": 1,
+      "Type": "SOCKS5",
+      "Host": "127.0.0.1",
+      "Port": "9401",
+      "Username": "",
+      "Password": "",
+      "ChainToConfigId": 2
+    },
+    {
+      "_note": "Second hop (Id=2): HTTP. Only reachable through proxy Id=1's tunnel - no rule points here directly. This one has no ChainToConfigId, so it's the last hop: it connects straight to the real destination.",
+      "Id": 2,
+      "Type": "HTTP",
+      "Host": "127.0.0.1",
+      "Port": "9402",
+      "Username": "",
+      "Password": "",
+      "ChainToConfigId": 0
+    }
+  ],
+  "ProxyRules": [
+    {
+      "_note": "Everything goes through proxy Id=1 (the entry hop) - the chain to Id=2 happens transparently inside the DLL, rules never need to know about it.",
+      "ProcessName": "*",
+      "TargetHosts": "*",
+      "TargetPorts": "*",
+      "TargetDomains": "",
+      "Protocol": "TCP",
+      "Action": "PROXY",
+      "ProxyConfigId": 1,
+      "IsEnabled": true
+    }
+  ]
+}

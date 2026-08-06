@@ -22,6 +22,9 @@ its author, Sourav Kalal / InterceptSuite.
   plus the fake-IP pool and WinDivert-level DNS query interception/
   response injection; `CustomDnsServers` and per-rule `DnsResolution` in
   `.pbprofile`.
+- **Proxy chaining**: `ProxyBridge_SetProxyChain`,
+  `ProxyBridge_TestProxyChain`; `ChainToConfigId` per proxy config in
+  `.pbprofile`. Mixes SOCKS5 and HTTP freely within a chain.
 - **Rename-friendly builds**: the CLI resolves its DLL's filename from its
   own filename at runtime instead of a hardcoded `ProxyBridgeCore.dll`.
 

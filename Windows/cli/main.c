@@ -38,6 +38,7 @@ typedef void (*pfnSetTrafficLogging)(int enable);
 typedef int  (*pfnStart)(void);
 typedef int  (*pfnStop)(void);
 typedef int  (*pfnSetProxyFallback)(uint32_t config_id, uint32_t fallback_config_id);
+typedef int  (*pfnSetProxyChain)(uint32_t config_id, uint32_t chain_to_config_id);
 typedef int  (*pfnSetHealthCheckEnabled)(int enabled, uint32_t interval_seconds);
 typedef int  (*pfnSetCustomDnsServers)(const char* servers);
 typedef int  (*pfnSetRuleDnsResolution)(uint32_t rule_id, const char* sources);
@@ -52,6 +53,7 @@ static pfnSetTrafficLogging     g_SetTraffic     = NULL;
 static pfnStart                 g_Start          = NULL;
 static pfnStop                  g_Stop           = NULL;
 static pfnSetProxyFallback      g_SetFallback    = NULL;
+static pfnSetProxyChain         g_SetChain       = NULL;
 static pfnSetHealthCheckEnabled g_SetHealthCheck = NULL;
 static pfnSetCustomDnsServers   g_SetCustomDns   = NULL;
 static pfnSetRuleDnsResolution  g_SetRuleDns     = NULL;
@@ -66,6 +68,7 @@ typedef struct {
     char     username[256];
     char     password[256];
     uint32_t fallback_profile_id; // "FallbackConfigId" - 0 = no fallback (Extended ProxyBridge)
+    uint32_t chain_to_profile_id; // "ChainToConfigId" - 0 = no chaining (Extended ProxyBridge)
 } PBProxyConfig;
 
 typedef struct {
@@ -378,6 +381,7 @@ static bool load_profile(const char* path, PBProfile* prof)
             jstr(buf, "Username", c->username, sizeof(c->username));
             jstr(buf, "Password", c->password, sizeof(c->password));
             c->fallback_profile_id = (uint32_t)jint(buf, "FallbackConfigId", 0);
+            c->chain_to_profile_id = (uint32_t)jint(buf, "ChainToConfigId", 0);
 
             free(buf);
 
@@ -458,6 +462,25 @@ static void apply_failover_config(const PBProfile* prof, const IdMap* id_map, in
     if (g_SetCustomDns && prof->custom_dns_servers[0])
         g_SetCustomDns(prof->custom_dns_servers);
 
+    if (g_SetChain)
+    {
+        for (int i = 0; i < prof->num_configs; i++)
+        {
+            const PBProxyConfig* c = &prof->configs[i];
+            if (c->chain_to_profile_id == 0)
+                continue;
+
+            uint32_t from_dll_id = 0, to_dll_id = 0;
+            for (int j = 0; j < id_map_n; j++)
+            {
+                if (id_map[j].profile_id == c->profile_id)          from_dll_id = id_map[j].dll_id;
+                if (id_map[j].profile_id == c->chain_to_profile_id) to_dll_id   = id_map[j].dll_id;
+            }
+            if (from_dll_id != 0 && to_dll_id != 0)
+                g_SetChain(from_dll_id, to_dll_id);
+        }
+    }
+
     if (!g_SetFallback || !g_SetHealthCheck)
         return; // DLL predates failover support - nothing more to wire up
 
@@ -531,6 +554,7 @@ static bool load_dll(void)
     // patched DLL. Missing = plain upstream DLL, silently skip failover setup
     // later rather than failing the whole load.
     g_SetFallback    = (pfnSetProxyFallback)     GetProcAddress(g_hDll, "ProxyBridge_SetProxyFallback");
+    g_SetChain       = (pfnSetProxyChain)        GetProcAddress(g_hDll, "ProxyBridge_SetProxyChain");
     g_SetHealthCheck = (pfnSetHealthCheckEnabled)GetProcAddress(g_hDll, "ProxyBridge_SetHealthCheckEnabled");
     g_SetCustomDns   = (pfnSetCustomDnsServers)  GetProcAddress(g_hDll, "ProxyBridge_SetCustomDnsServers");
     g_SetRuleDns     = (pfnSetRuleDnsResolution) GetProcAddress(g_hDll, "ProxyBridge_SetRuleDnsResolution");
