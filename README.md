@@ -121,7 +121,7 @@ unzip WinDivert-2.2.2-A.zip
 x86_64-w64-mingw32-gcc -std=gnu11 -shared -O2 -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS \
   -I WinDivert-2.2.2-A/include Windows/src/ProxyBridge.c \
   -L WinDivert-2.2.2-A/x64 -lWinDivert -lws2_32 -liphlpapi \
-  -o ProxyBridgeCore.dll
+  -o ProxyBridge_CLI.dll
 
 x86_64-w64-mingw32-gcc -std=gnu11 -O2 -D_WIN32_WINNT=0x0601 \
   Windows/cli/main.c -lwinhttp -lshell32 -ladvapi32 \
@@ -131,14 +131,20 @@ x86_64-w64-mingw32-gcc -std=gnu11 -O2 -D_WIN32_WINNT=0x0601 \
 i686-w64-mingw32-gcc -std=gnu11 -shared -O2 -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS \
   -I WinDivert-2.2.2-A/include Windows/src/ProxyBridge.c \
   -L WinDivert-2.2.2-A/x86 -lWinDivert -lws2_32 -liphlpapi \
-  -o ProxyBridgeCore32.dll
+  -o ProxyBridge_CLI.dll
 
 i686-w64-mingw32-gcc -std=gnu11 -O2 -D_WIN32_WINNT=0x0601 \
   Windows/cli/main.c -lwinhttp -lshell32 -ladvapi32 \
-  -o ProxyBridge_CLI32.exe
+  -o ProxyBridge_CLI.exe
 ```
 
-Copy `ProxyBridgeCore.dll`, `ProxyBridge_CLI.exe`, `WinDivert.dll`, and
+IMPORTANT: the .exe and .dll names must match exactly (just swap the
+extension) — see "Renaming" below. Build the x64 pair and the x86 pair
+into **separate folders** (the commands above intentionally reuse the
+same output names for both, since only one architecture's build lives
+in a given folder at a time).
+
+Copy `ProxyBridge_CLI.exe`, `ProxyBridge_CLI.dll`, `WinDivert.dll`, and
 `WinDivert64.sys` (from the WinDivert release zip's `x64/` folder) into
 the same directory on a Windows machine for the x64 build — or the x86
 equivalents plus **both** `WinDivert32.sys` and `WinDivert64.sys` (see
@@ -155,6 +161,9 @@ kernel-level access).
   covering single-app proxying, multiple proxies, path-based rules,
   domain-based routing, blocking + LAN exceptions, automatic failover,
   and the three DNS resolution priority modes.
+- [`testing/`](testing) — ready-to-run `.bat` scripts + minimal configs,
+  one per feature, for quickly checking "does X work on my machine"
+  without writing anything yourself first.
 - [`NOTICE.md`](NOTICE.md) — summary of what's new in this fork versus
   upstream ProxyBridge.
 

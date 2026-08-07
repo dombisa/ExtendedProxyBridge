@@ -437,7 +437,7 @@ static bool load_profile(const char* path, PBProfile* prof)
 }
 
 // ── DLL loader ────────────────────────────────────────────────────────────────
-static char g_dll_display_name[MAX_PATH] = "ProxyBridgeCore.dll"; // updated by load_dll() to the real resolved filename
+static char g_dll_display_name[MAX_PATH] = "ProxyBridge_CLI.dll"; // updated by load_dll() to the real resolved filename
 
 #define LOAD_FN(type, var, name)                                                  \
     do {                                                                          \
@@ -508,7 +508,7 @@ static bool load_dll(void)
 {
     // Extended ProxyBridge: the DLL is expected to be named after the running
     // exe itself. Rename ProxyBridge_CLI.exe -> MyProxy.exe and rename
-    // ProxyBridgeCore.dll -> MyProxy.dll to match, and it just works, no
+    // ProxyBridge_CLI.dll -> MyProxy.dll to match, and it just works, no
     // recompile needed - both files travel together under whatever name
     // you picked.
     char dll_path[MAX_PATH];

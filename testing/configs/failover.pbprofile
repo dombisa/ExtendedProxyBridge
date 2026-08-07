@@ -1,0 +1,16 @@
+{
+  "_purpose": "FAILOVER CHECK. Two proxies, health check every 5 seconds (fast, just for this test - use 10-30 in a real profile). Watch the log for 'went DOWN' / 'is back UP' lines if you point ProxyA at something you can turn on/off during the test.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+  "HealthCheckEnabled": true,
+  "HealthCheckIntervalSeconds": 5,
+  "ProxyConfigs": [
+    { "Id": 1, "Type": "SOCKS5", "Host": "127.0.0.1", "Port": "1080", "Username": "", "Password": "", "FallbackConfigId": 2 },
+    { "Id": 2, "Type": "SOCKS5", "Host": "127.0.0.1", "Port": "1081", "Username": "", "Password": "", "FallbackConfigId": 0 }
+  ],
+  "ProxyRules": [
+    { "ProcessName": "TestApp1.exe", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "PROXY", "ProxyConfigId": 1, "IsEnabled": true },
+    { "ProcessName": "*", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "DIRECT", "ProxyConfigId": 0, "IsEnabled": true }
+  ]
+}

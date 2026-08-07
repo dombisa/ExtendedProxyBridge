@@ -15,9 +15,10 @@ through Windows' system proxy setting — so it sees traffic even from
 programs that ignore system proxy settings entirely.
 
 It's made of two parts:
-  - ProxyBridgeCore.dll — the "engine": packet interception, rule
+  - ProxyBridge_CLI.dll — the "engine": packet interception, rule
     matching, talking to the proxy servers. Everything important happens
-    here.
+    here. (Shipped under this name to match the .exe by default - see
+    section 3.1 on renaming, since the two names must always match.)
   - ProxyBridge_CLI.exe — the console front-end: loads the DLL, reads a
     config file (.pbprofile), and controls start/stop, including running
     as a Windows service.
@@ -93,7 +94,10 @@ already in the original ProxyBridge — we left it untouched.
 3. FILES AND WHERE TO PUT THEM
 --------------------------------------------------------------------------------
   ProxyBridge_CLI.exe    — the executable, console front-end.
-  ProxyBridgeCore.dll    — MUST be in the same folder as the .exe.
+  ProxyBridge_CLI.dll    — MUST be in the same folder as the .exe, and
+                            MUST be named to match it exactly (see 3.1) -
+                            this is why it's shipped under this name and
+                            not something like "ProxyBridgeCore.dll".
   WinDivert.dll          — MUST be in the same folder as the .exe.
   WinDivert64.sys        — MUST be in the same folder as the .exe
                             (kernel driver, for 64-bit systems).
@@ -115,8 +119,11 @@ startup and looks for a DLL with that same name next to it — no
 recompiling needed.
 
 Example: rename ProxyBridge_CLI.exe to MyAnotherProxy.exe — then
-ProxyBridgeCore.dll also needs to become MyAnotherProxy.dll (exactly
-that — no "Core" in the name, the whole name matches the exe).
+ProxyBridge_CLI.dll also needs to become MyAnotherProxy.dll (the WHOLE
+name matches the exe, nothing added or removed). Forgetting to rename
+the DLL too is the single most common mistake here — the program will
+refuse to start with a clear "Cannot load MyAnotherProxy.dll" error if
+you rename only one of the two files.
 WinDivert.dll and WinDivert64.sys do NOT need renaming (and can't be —
 those are third-party driver files).
 
@@ -550,8 +557,9 @@ connection reveals identity or location), this behaviour should change
 to BLOCK-on-total-failure instead — let us know, that would need a
 separate addition; it isn't configurable through the profile right now.
 
-Limitation: failover is our addition, it only works with the
-ProxyBridgeCore.dll from this fork. With the official upstream DLL from
+Limitation: failover is our addition, it only works with this fork's
+own DLL (the one shipped alongside ProxyBridge_CLI.exe in this
+project). With the official upstream DLL from
 InterceptSuite, the HealthCheckEnabled/FallbackConfigId fields are just
 read and ignored (the program won't break, but nothing happens either)
 — the CLI itself detects this (via the absence of the needed functions
@@ -611,7 +619,7 @@ up automatically on reboot, without needing an open console or being
 logged in as a specific user.
 
 Steps:
-    1. Put all 4 files (ProxyBridge_CLI.exe, ProxyBridgeCore.dll,
+    1. Put all 4 files (ProxyBridge_CLI.exe, ProxyBridge_CLI.dll,
        WinDivert.dll, WinDivert64.sys) in a permanent folder, e.g.
        C:\Program Files\ExtendedProxyBridge\ (not a temp folder or
        Downloads — the service needs a stable path to refer to).
@@ -703,7 +711,7 @@ a genuine, valid combination you could build a real profile out of.
 
 "Failed to open WinDivert" / "Ensure WinDivert64.sys is present"
     Make sure WinDivert.dll and WinDivert64.sys are in the SAME folder
-    as ProxyBridge_CLI.exe and ProxyBridgeCore.dll — all four files
+    as ProxyBridge_CLI.exe and ProxyBridge_CLI.dll — all four files
     together, always. Also check you're really running as Administrator
     (see above), and that Windows' "Core Isolation" / "Memory
     Integrity" feature isn't set to a mode that blocks unsigned or

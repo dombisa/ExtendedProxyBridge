@@ -1,0 +1,16 @@
+{
+  "_purpose": "DNS RESOLUTION CHECK. Three test apps, one per DNS source order, so you can see which log lines belong to which mode. Watch for 'Rule ID N DNS resolution policy set' and 'Custom DNS server added' lines at startup.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+  "CustomDnsServers": "94.140.14.14:53;9.9.9.9:53",
+  "ProxyConfigs": [
+    { "Id": 1, "Type": "SOCKS5", "Host": "127.0.0.1", "Port": "1080", "Username": "", "Password": "" }
+  ],
+  "ProxyRules": [
+    { "ProcessName": "TestAppProxyDns.exe",   "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "PROXY", "ProxyConfigId": 1, "IsEnabled": true, "DnsResolution": "proxy;custom;system" },
+    { "ProcessName": "TestAppCustomDns.exe",  "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "PROXY", "ProxyConfigId": 1, "IsEnabled": true, "DnsResolution": "custom;system" },
+    { "ProcessName": "TestAppSystemDns.exe",  "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "PROXY", "ProxyConfigId": 1, "IsEnabled": true, "DnsResolution": "system" },
+    { "ProcessName": "*", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "DIRECT", "ProxyConfigId": 0, "IsEnabled": true }
+  ]
+}

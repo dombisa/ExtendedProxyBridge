@@ -1,0 +1,14 @@
+{
+  "_purpose": "PROXY CHAINING CHECK. hop1 (SOCKS5) chains to hop2 (HTTP). Watch for 'Proxy config ID 1 chains -> 2' in the log at startup.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+  "ProxyConfigs": [
+    { "Id": 1, "Type": "SOCKS5", "Host": "127.0.0.1", "Port": "9401", "Username": "", "Password": "", "ChainToConfigId": 2 },
+    { "Id": 2, "Type": "HTTP",   "Host": "127.0.0.1", "Port": "9402", "Username": "", "Password": "", "ChainToConfigId": 0 }
+  ],
+  "ProxyRules": [
+    { "ProcessName": "TestApp1.exe", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "TCP", "Action": "PROXY", "ProxyConfigId": 1, "IsEnabled": true },
+    { "ProcessName": "*", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "DIRECT", "ProxyConfigId": 0, "IsEnabled": true }
+  ]
+}

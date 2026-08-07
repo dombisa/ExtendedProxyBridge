@@ -1,0 +1,13 @@
+{
+  "_purpose": "BASIC SANITY CHECK. Confirms the program starts, loads the DLL, parses a config, and gets as far as trying to open WinDivert. No advanced features used at all - if this doesn't work, nothing else will either.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+  "ProxyConfigs": [
+    { "Id": 1, "Type": "SOCKS5", "Host": "127.0.0.1", "Port": "1080", "Username": "", "Password": "" }
+  ],
+  "ProxyRules": [
+    { "ProcessName": "TestApp1.exe", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "PROXY", "ProxyConfigId": 1, "IsEnabled": true },
+    { "ProcessName": "*", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "DIRECT", "ProxyConfigId": 0, "IsEnabled": true }
+  ]
+}

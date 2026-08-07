@@ -15,6 +15,11 @@ under a dedicated `WINEARCH=win32` prefix, since a normal 64-bit Wine
 prefix can't run 32-bit binaries without one) — including the failover
 health-check logic against real sockets, not just "it compiled".
 
+**Note the .exe and .dll names on disk here already match each other**
+(`ProxyBridge_CLI.exe` + `ProxyBridge_CLI.dll`) — that's not a
+coincidence, it's required (see "Renaming" in the main README). If you
+rename the .exe, rename the .dll to match too, or it won't load.
+
 ## You still need WinDivert's own files
 
 Not ours to redistribute — download them from the official release:
@@ -32,7 +37,7 @@ https://github.com/basil00/WinDivert/releases/tag/v2.2.2
   at runtime, you just need both present.
 
 Put the matching WinDivert files in the same folder as
-`ProxyBridge_CLI.exe`/`ProxyBridgeCore.dll` for whichever architecture
+`ProxyBridge_CLI.exe`/`ProxyBridge_CLI.dll` for whichever architecture
 you're using — all files together, one architecture per folder, don't
 mix x64 and x86 files in the same folder.
 

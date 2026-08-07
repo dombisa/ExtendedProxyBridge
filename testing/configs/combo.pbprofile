@@ -1,0 +1,21 @@
+{
+  "_readme": "FULL COMBINATION TEST PROFILE - exercises every feature together: chaining, failover, custom DNS, per-rule DNS policy, path-based rules, domain rules, LAN exception, block, catch-all.",
+  "Version": "1.0",
+  "LocalhostViaProxy": false,
+  "IsTrafficLoggingEnabled": true,
+  "HealthCheckEnabled": true,
+  "HealthCheckIntervalSeconds": 10,
+  "CustomDnsServers": "94.140.14.14:53;9.9.9.9:53",
+  "ProxyConfigs": [
+    { "Id": 1, "Type": "SOCKS5", "Host": "203.0.113.10", "Port": "1080", "Username": "", "Password": "", "FallbackConfigId": 2, "ChainToConfigId": 3 },
+    { "Id": 2, "Type": "SOCKS5", "Host": "198.51.100.20", "Port": "1080", "Username": "", "Password": "", "FallbackConfigId": 0, "ChainToConfigId": 0 },
+    { "Id": 3, "Type": "HTTP", "Host": "203.0.113.11", "Port": "8080", "Username": "", "Password": "", "FallbackConfigId": 0, "ChainToConfigId": 0 }
+  ],
+  "ProxyRules": [
+    { "ProcessName": "chrome.exe", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "*.google.com;*.gstatic.com", "Protocol": "BOTH", "Action": "PROXY", "ProxyConfigId": 1, "IsEnabled": true, "DnsResolution": "proxy;custom;system" },
+    { "ProcessName": "C:\\Games\\WorkCopy\\game.exe", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "TCP", "Action": "PROXY", "ProxyConfigId": 1, "IsEnabled": true, "DnsResolution": "custom;system" },
+    { "ProcessName": "suspicious_app.exe", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "BLOCK", "ProxyConfigId": 0, "IsEnabled": true },
+    { "ProcessName": "*", "TargetHosts": "192.168.*.*;10.*.*.*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "DIRECT", "ProxyConfigId": 0, "IsEnabled": true },
+    { "ProcessName": "*", "TargetHosts": "*", "TargetPorts": "*", "TargetDomains": "", "Protocol": "BOTH", "Action": "PROXY", "ProxyConfigId": 1, "IsEnabled": true }
+  ]
+}
